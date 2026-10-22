@@ -18,8 +18,8 @@ from typing import Any, Optional
 
 SMALL_HOST_ENV = "UNSLOTH_DIFFUSION_SMALL_HOST"
 HOST_RAM_CHECK_ENV = "UNSLOTH_DIFFUSION_HOST_RAM_CHECK"
-# test hook: cap the host RAM the diffusion guards see (total and available), the Windows counterpart of
-# the cgroup ceiling the Linux reading already honours
+# test hook: cap the host RAM the diffusion guards see (total, physical available and commit headroom),
+# the Windows counterpart of the cgroup ceiling the Linux reading already honours
 HOST_RAM_LIMIT_ENV = "UNSLOTH_DIFFUSION_HOST_RAM_LIMIT_MIB"
 SMALL_HOST_ATTR = "_unsloth_small_host"
 
@@ -29,9 +29,6 @@ _HOST_RESERVE_MIN_MIB = 3072
 _HOST_RESERVE_FRACTION = 0.10
 # fp16 T5 keeps ``wo`` in fp32 (``_keep_in_fp32_modules``): 9.5 GB stored, 11.0 GB loaded.
 _CONVERT_MARGIN = 1.15
-# A converting load holds the copy-on-write source view next to the converted copy, and Windows charges that
-# view to commit (#13432); measured qwen-image loads peaked near 2x the copy-only estimate.
-_TRANSIENT_MARGIN = 1.5
 _INT8_MIN_ELEMENTS = 1 << 22
 # DiT denoisers the route stores as int8; a UNet (mostly convs) converts dense like any other non-encoder component
 INT8_DENOISER_NAMES = ("transformer", "transformer_2", "unconditional_transformer")
@@ -84,6 +81,8 @@ class StoredComponent:
     dtype: str  # dominant stored float dtype ("bfloat16", "float16", "float32", ...)
     # stored MiB of ``_keep_in_fp32_modules`` tensors: they convert to fp32 on the host even on the route
     kept_fp32_mib: int = 0
+    # Full selected safetensors views, once per component load; None when selection/size is unknown.
+    source_mib: Optional[int] = None
 
 
 def _keep_fp32_from_config(sub: Path) -> tuple[str, ...]:
@@ -108,6 +107,38 @@ def _weight_files(sub: Path) -> list[Path]:
     return plain or files
 
 
+def _source_mapping_mib(sub: Path, files: list[Path]) -> Optional[int]:
+    """Rounded full-file extents for an unambiguous default safetensors checkpoint.
+
+    Tensors within one file share a view. Separate component loads count separately,
+    even when their files resolve to the same path. Alternative/unknown layouts do
+    not provide a reliable mapping estimate; the physical estimate remains usable.
+    """
+    try:
+        selected = {f.name for f in files}
+        for stem in ("model", "diffusion_pytorch_model"):
+            default = sub / f"{stem}.safetensors"
+            if default.is_file():
+                expected = {default.name}
+                break
+            index = sub / f"{stem}.safetensors.index.json"
+            if index.is_file():
+                weight_map = json.loads(index.read_text(encoding = "utf-8"))["weight_map"]
+                expected = set(weight_map.values())
+                if not expected or any(
+                    not isinstance(p, str) or Path(p).name != p for p in expected
+                ):
+                    return None
+                break
+        else:
+            return None
+        if not selected or selected != expected:
+            return None
+        return sum(-(-f.stat().st_size // _MIB) for f in files)
+    except Exception:  # noqa: BLE001 - missing files or ambiguous metadata cannot prove mapping size
+        return None
+
+
 def stored_components(snapshot: Any) -> dict[str, StoredComponent]:
     """Per component: stored MiB and dominant dtype, from safetensors headers only."""
     out: dict[str, StoredComponent] = {}
@@ -118,15 +149,23 @@ def stored_components(snapshot: Any) -> dict[str, StoredComponent]:
         for sub in sorted(p for p in root.iterdir() if p.is_dir()):
             totals: dict[str, int] = {}
             keep = _keep_fp32_from_config(sub) if sub.name.startswith("text_encoder") else ()
-            for f in _weight_files(sub):
-                for k, v in _safetensors_bytes_by_dtype(f, keep).items():
+            files = _weight_files(sub)
+            readable = True
+            for f in files:
+                sizes = _safetensors_bytes_by_dtype(f, keep)
+                readable = readable and bool(sizes)
+                for k, v in sizes.items():
                     totals[k] = totals.get(k, 0) + v
             kept = totals.pop("kept", 0)
             if not totals:
                 continue
             dtype = max(totals.items(), key = lambda kv: kv[1])[0]
             out[sub.name] = StoredComponent(
-                sub.name, -(-sum(totals.values()) // _MIB), dtype, -(-kept // _MIB)
+                sub.name,
+                -(-sum(totals.values()) // _MIB),
+                dtype,
+                -(-kept // _MIB),
+                _source_mapping_mib(sub, files) if readable else None,
             )
     except Exception:  # noqa: BLE001 - no claim
         return {}
@@ -149,22 +188,25 @@ def resolve_snapshot_dir(repo_or_dir: Any, cache_dir: Any = None) -> Optional[Pa
     return None
 
 
-def host_ram_mib() -> tuple[Optional[int], Optional[int]]:
-    """(total, available) host MiB, both capped by an enforcing cgroup; available additionally capped by the
-    Windows commit headroom (commit exhaustion is the #13432 failure mode, invisible to a physical reading)
-    and by the ``HOST_RAM_LIMIT_ENV`` test hook."""
-    from .diffusion_memory import _host_available_mib, _host_ram_capacity_mib
+def host_memory_budgets_mib() -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Separately measured capacity, physical availability and commit, capped only downwards."""
+    from .diffusion_memory import _host_memory_budgets_mib
 
-    total = _host_ram_capacity_mib()
-    available = _host_available_mib()
+    budgets = _host_memory_budgets_mib()
     try:
         limit = int((os.environ.get(HOST_RAM_LIMIT_ENV) or "").strip())
     except ValueError:
         limit = 0
-    if limit > 0:
-        total = limit if total is None else min(total, limit)
-        available = limit if available is None else min(available, limit)
-    return total, available
+    return tuple(
+        min(value, limit) if value is not None and limit > 0 else value for value in budgets
+    )
+
+
+def host_ram_mib() -> tuple[Optional[int], Optional[int]]:
+    """Legacy single-file guard API; small-host routing uses the separate budgets above."""
+    total, physical, commit = host_memory_budgets_mib()
+    known = [v for v in (physical, commit) if v is not None]
+    return total, min(known) if known else None
 
 
 def host_reserve_mib(total_mib: Optional[int]) -> int:
@@ -189,11 +231,21 @@ class SmallHostDecision:
     total_mib: Optional[int] = None
     dense_host_mib: int = 0
     route_host_mib: int = 0
-    # pre-built single-file bytes (GGUF DiT) added to both routes' host need
+    # Already built single-file bytes, diagnostic only: reflected in measured remaining budgets.
     prebuilt_host_mib: int = 0
     # component -> stored dtype it loads at (memory-mapped)
     storage_dtypes: dict[str, str] = field(default_factory = dict)
     refuse: Optional[str] = None
+    commit_available_mib: Optional[int] = None
+    reserve_mib: int = 0
+    source_mapping_mib: Optional[int] = None
+    dense_workspace_mib: Optional[int] = None
+    route_workspace_mib: Optional[int] = None
+    dense_commit_mib: Optional[int] = None
+    route_commit_mib: Optional[int] = None
+    dense_commit_lower_bound_mib: int = 0
+    route_commit_lower_bound_mib: int = 0
+    budget_checked: bool = False
 
 
 def decide_small_host(
@@ -205,10 +257,14 @@ def decide_small_host(
     host_available_mib: Optional[int],
     lora_active: bool = False,
     prebuilt_host_mib: int = 0,
+    host_commit_mib: Optional[int] = None,
+    dense_workspace_mib: Optional[int] = None,
+    route_workspace_mib: Optional[int] = None,
 ) -> SmallHostDecision:
     """Whether this pipeline load takes the small-host route. Only CUDA loads converting large bf16 components
-    (fp16 / fp32 compute) change; same-dtype loads already stay memory-mapped. ``prebuilt_host_mib`` adds bytes
-    that sit on the host before ``from_pretrained`` runs (a single-file GGUF transformer) to both routes."""
+    (fp16 / fp32 compute) change; same-dtype loads already stay memory-mapped. Already built bytes are
+    diagnostic only. Unknown source/workspace estimates permit lower-bound checks, never a complete commit fit.
+    """
     if small_host_disabled():
         return SmallHostDecision(False, f"{SMALL_HOST_ENV}=0")
     if str(device) != "cuda":
@@ -237,61 +293,89 @@ def decide_small_host(
         for n, c in converted.items()
     )
     reserve = host_reserve_mib(host_total_mib)
-    # A pre-built single-file DiT occupies the host in both routes (checkpoint dict plus dequant staging);
-    # the converting load additionally holds the copy-on-write source view next to the converted copy, which
-    # Windows charges to commit (#13432) — measured peaks ran near 2x the copy-only estimate.
     prebuilt = max(0, int(prebuilt_host_mib or 0))
-    dense_need = int(dense * _TRANSIENT_MARGIN) + prebuilt
-    route_need = route + prebuilt
+    sources = [c.source_mib for c in converted.values()]
+    known_source = sum(s for s in sources if s is not None)
+    source = known_source if all(s is not None for s in sources) else None
+    # These are lower bounds while workspace is unknown: e.g. safetensors can
+    # briefly hold an additional COW view. Never report a complete commit fit
+    # without a justified workspace estimate, but still reject a known shortfall.
+    dense_lower = known_source + dense + (dense_workspace_mib or 0)
+    route_lower = known_source + route + (route_workspace_mib or 0)
+    dense_commit = dense_lower if source is not None and dense_workspace_mib is not None else None
+    route_commit = route_lower if source is not None and route_workspace_mib is not None else None
+    details = dict(
+        available_mib = host_available_mib,
+        total_mib = host_total_mib,
+        dense_host_mib = dense,
+        route_host_mib = route,
+        prebuilt_host_mib = prebuilt,
+        commit_available_mib = host_commit_mib,
+        reserve_mib = reserve,
+        source_mapping_mib = source,
+        dense_workspace_mib = dense_workspace_mib,
+        route_workspace_mib = route_workspace_mib,
+        dense_commit_mib = dense_commit,
+        route_commit_mib = route_commit,
+        dense_commit_lower_bound_mib = dense_lower,
+        route_commit_lower_bound_mib = route_lower,
+        budget_checked = host_available_mib is not None or host_commit_mib is not None,
+    )
     storage = {name: comp.dtype for name, comp in converted.items()}
     forced = small_host_forced()
-    if host_available_mib is None and not forced:
-        return SmallHostDecision(False, "host RAM unreadable", dense_host_mib = dense)
-    fits = host_available_mib is not None and dense_need + reserve <= int(host_available_mib)
-    if fits and not forced:
-        return SmallHostDecision(
-            False,
-            f"dense {compute} load ({dense_need} MiB) fits {host_available_mib} MiB available host RAM",
-            host_available_mib,
-            host_total_mib,
-            dense,
-            route,
-            prebuilt_host_mib = prebuilt,
+    if not details["budget_checked"] and not forced:
+        return SmallHostDecision(False, "host RAM unreadable", **details)
+
+    def check(need: int, commit_need: Optional[int], lower: int) -> tuple[bool, str]:
+        physical_failed = host_available_mib is not None and need + reserve > host_available_mib
+        commit_failed = host_commit_mib is not None and lower + reserve > host_commit_mib
+        physical = (
+            "physical unchecked (available unreadable)"
+            if host_available_mib is None
+            else f"physical {need} + reserve {reserve} = {need + reserve} MiB "
+            f"{'>' if physical_failed else '<='} {host_available_mib} MiB"
         )
+        if host_commit_mib is None:
+            commit = "commit unchecked (headroom unreadable)"
+        else:
+            status = (
+                "commit"
+                if commit_need is not None
+                else "commit unchecked (source/workspace unmeasured); lower bound"
+            )
+            commit = (
+                f"{status} {lower} + reserve {reserve} = {lower + reserve} MiB "
+                f"{'>' if commit_failed else '<='} {host_commit_mib} MiB"
+            )
+        return physical_failed or commit_failed, f"{physical}; {commit}"
+
+    dense_failed, dense_reason = check(dense, dense_commit, dense_lower)
+    if not dense_failed and not forced:
+        return SmallHostDecision(False, f"dense {compute} load: {dense_reason}", **details)
     if lora_active and not forced:
         # the int8 denoiser cannot carry adapters
         return SmallHostDecision(
             False,
-            f"LoRA adapters need the dense denoiser (dense load ~{dense_need} MiB, {host_available_mib} MiB available)",
-            host_available_mib,
-            host_total_mib,
-            dense,
-            route,
-            prebuilt_host_mib = prebuilt,
+            f"LoRA adapters need the dense denoiser; dense {compute} load: {dense_reason}",
+            **details,
         )
+    route_failed, route_reason = check(route, route_commit, route_lower)
     refuse = None
-    if (
-        host_available_mib is not None
-        and route_need + reserve > int(host_available_mib)
-        and not host_ram_check_disabled()
-    ):
-        refuse = _refusal(route_need, reserve, host_available_mib, "even the low-memory route")
-    why = (
-        f"{SMALL_HOST_ENV}=1"
-        if forced and fits
-        else f"dense {compute} load needs ~{dense_need} MiB + {reserve} MiB reserve of host RAM, "
-        f"{host_available_mib} MiB available"
-    )
+    if route_failed and not host_ram_check_disabled():
+        refuse = (
+            f"Not enough system RAM to load this model: even the low-memory route exceeds a host memory budget: "
+            f"{route_reason}. Close other applications, pick a smaller or GGUF model, "
+            f"or set {HOST_RAM_CHECK_ENV}=0 to try anyway."
+        )
+    why = f"dense {compute} load: {dense_reason}; low-memory route: {route_reason}"
+    if forced:
+        why = f"{SMALL_HOST_ENV}=1; {why}"
     return SmallHostDecision(
-        True, why, host_available_mib, host_total_mib, dense, route, prebuilt, storage, refuse
-    )
-
-
-def _refusal(need: int, reserve: int, available: Optional[int], what: str) -> str:
-    return (
-        f"Not enough system RAM to load this model: {what} needs about {(need + reserve) / 1024:.1f} GB "
-        f"of host memory and {((available or 0)) / 1024:.1f} GB is available. Close other applications, "
-        f"pick a smaller or GGUF model, or set {HOST_RAM_CHECK_ENV}=0 to try anyway."
+        True,
+        why,
+        storage_dtypes = storage,
+        refuse = refuse,
+        **details,
     )
 
 

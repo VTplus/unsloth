@@ -159,7 +159,7 @@ from .diffusion_small_host import (
     INT8_DENOISER_NAMES,
     decide_small_host,
     engaged_on as small_host_engaged_on,
-    host_ram_mib,
+    host_memory_budgets_mib,
     resolve_snapshot_dir,
     stored_components,
     torch_dtype_map as small_host_torch_dtype_map,
@@ -180,8 +180,6 @@ from .diffusion_memory import (
     estimate_gguf_resident_mib,
     estimate_image_runtime_mib,
     estimate_safetensors_dense_mib,
-    _available_system_memory_mib,
-    _windows_commit_headroom_mib,
     file_size_mib,
     largest_streamable_companion_mib,
     normalize_memory_mode,
@@ -11023,40 +11021,28 @@ class DiffusionBackend:
         }
         # the pre-built single-file DiT (GGUF) already sits on the host before from_pretrained runs
         prebuilt = file_size_mib(single_file_path) or 0
-        total, available = host_ram_mib()
-        # keep visible which side binds the available figure: physical RAM or the Windows commit headroom
-        physical = _available_system_memory_mib()
-        commit = _windows_commit_headroom_mib()
+        total, physical, commit = host_memory_budgets_mib()
         decision = decide_small_host(
             comps,
             dtype,
             device = str(getattr(target, "backend", None) or getattr(target, "device", "")),
             host_total_mib = total,
-            host_available_mib = available,
+            host_available_mib = physical,
+            host_commit_mib = commit,
             lora_active = lora_active,
             prebuilt_host_mib = prebuilt,
         )
-        physical_display = f"{physical} MiB" if physical is not None else "-"
-        commit_display = f"{commit} MiB" if commit is not None else "-"
-        if decision.engaged or decision.refuse:
+        if decision.budget_checked or decision.engaged:
             logger.info(
-                "diffusion.small_host: engaged=%s (%s); stored-dtype components=%s; prebuilt=%d MiB; "
-                "host available: physical %s, commit %s",
+                "diffusion.small_host: engaged=%s (%s); stored-dtype components=%s; "
+                "prebuilt=%d MiB (diagnostic only); source=%s MiB; workspace dense=%s MiB, route=%s MiB",
                 decision.engaged,
                 decision.reason,
                 decision.storage_dtypes,
-                prebuilt,
-                physical_display,
-                commit_display,
-            )
-        elif decision.available_mib is not None:
-            # a measured non-route decision logs too, so a fits case is not silent (see #13432)
-            logger.info(
-                "diffusion.small_host: engaged=%s (%s); host available: physical %s, commit %s",
-                decision.engaged,
-                decision.reason,
-                physical_display,
-                commit_display,
+                decision.prebuilt_host_mib,
+                decision.source_mapping_mib if decision.source_mapping_mib is not None else "-",
+                decision.dense_workspace_mib if decision.dense_workspace_mib is not None else "-",
+                decision.route_workspace_mib if decision.route_workspace_mib is not None else "-",
             )
         if decision.refuse:
             raise RuntimeError(decision.refuse)

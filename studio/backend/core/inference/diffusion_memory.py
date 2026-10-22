@@ -1013,15 +1013,19 @@ def _windows_commit_headroom_mib() -> Optional[int]:
         return None
 
 
-def _host_available_mib() -> Optional[int]:
-    """Available host MiB for the diffusion guards: system available capped by the Windows commit headroom."""
-    available = _available_system_memory_mib()
-    headroom = _windows_commit_headroom_mib()
-    if headroom is None:
-        return available
-    if available is None:
-        return headroom
-    return min(available, headroom)
+def _host_memory_budgets_mib() -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Capacity, usable physical RAM and Windows commit headroom, sampled once each.
+
+    Unlike the legacy single-file availability helper, these budgets have different
+    requirements and must not be collapsed before the small-host decision.
+    """
+    total = _host_ram_capacity_mib()
+    physical = _available_system_memory_mib()
+    try:
+        commit = _windows_commit_headroom_mib()
+    except Exception:  # noqa: BLE001 - retain the physical fallback if the optional reader fails
+        commit = None
+    return total, physical, commit
 
 
 def _xpu_memory() -> tuple[Optional[int], Optional[int]]:
