@@ -34,7 +34,7 @@ KAGGLE_AVAILABLE = 29900
 
 @pytest.fixture(autouse = True)
 def _clean_env(monkeypatch):
-    for name in (sh.SMALL_HOST_ENV, sh.HOST_RAM_CHECK_ENV):
+    for name in (sh.SMALL_HOST_ENV, sh.HOST_RAM_CHECK_ENV, sh.NO_SWAP_ENV):
         monkeypatch.delenv(name, raising = False)
 
 
@@ -435,3 +435,130 @@ def test_lora_refused_and_status_reports_the_int8_route():
         types.SimpleNamespace(_unsloth_small_host = {"components": {"transformer": "cast on device"}})
     )
     assert not _small_host_int8(object())
+
+
+def test_no_swap_routes_an_image_video_diffusion_load_above_the_physical_budget(monkeypatch):
+    # The dense commit estimate fits the Windows headroom but exceeds the physical budget. No-swap routes
+    # image/video diffusion; llama/chat loads use a separate loader. No actual paging is measured here.
+    args = dict(total = 64 * 1024, available = 58 * 1024, host_commit_mib = 85 * 1024)
+    plain = _decide(FLUX1, **args)
+    assert not plain.engaged and not plain.no_swap and "commit headroom" in plain.reason
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    capped = _decide(FLUX1, **args)
+    assert (
+        capped.engaged
+        and capped.refuse is None
+        and capped.no_swap
+        and capped.commit_mib == 58 * 1024
+        and "no-swap budget" in capped.reason
+    )
+
+
+def test_no_swap_boundary_need_equal_to_the_physical_budget(monkeypatch):
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    stored = sum(c.mib for c in (FLUX1["transformer"], FLUX1["text_encoder_2"]))
+    dense = int(stored * sh._CONVERT_MARGIN)
+    need = dense + int(stored * sh._CONVERT_MARGIN) + sh.host_reserve_mib(64 * 1024)
+    fits = _decide(FLUX1, total = 64 * 1024, available = need, host_commit_mib = 90 * 1024)
+    assert not fits.engaged and fits.no_swap and fits.commit_mib == need
+    routes = _decide(FLUX1, total = 64 * 1024, available = need - 1, host_commit_mib = 90 * 1024)
+    assert routes.engaged and routes.no_swap and routes.refuse is None
+
+
+def test_no_swap_leaves_the_no_commit_reading_path_untouched(monkeypatch):
+    # Linux / macOS report no commit headroom: the option must not change a decision there
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    with_env = _decide(FLUX1)
+    assert with_env.commit_mib is None and not with_env.no_swap
+    monkeypatch.delenv(sh.NO_SWAP_ENV, raising = False)
+    without_env = _decide(FLUX1)
+    assert (with_env.engaged, with_env.reason, with_env.refuse) == (
+        without_env.engaged,
+        without_env.reason,
+        without_env.refuse,
+    )
+
+
+def test_no_swap_keeps_the_dense_image_video_lora_exception(monkeypatch):
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    d = _decide(
+        FLUX1,
+        total = 64 * 1024,
+        available = 58 * 1024,
+        host_commit_mib = 85 * 1024,
+        lora_active = True,
+    )
+    assert not d.engaged and d.refuse is None and d.no_swap
+    assert d.commit_mib == 58 * 1024
+    assert d.dense_commit_mib + sh.host_reserve_mib(d.total_mib) > d.commit_mib
+    assert "LoRA" in d.reason and "no-swap budget" in d.reason
+
+
+@pytest.mark.parametrize("commit", [0, 20 * 1024])
+def test_no_swap_preserves_a_smaller_or_exhausted_commit_budget(monkeypatch, commit):
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    d = _decide(FLUX1, total = 64 * 1024, available = 58 * 1024, host_commit_mib = commit)
+    assert d.engaged and d.refuse is None and d.no_swap and d.commit_mib == commit
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_no_swap_does_not_invent_an_unreadable_physical_budget(monkeypatch, forced):
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    if forced:
+        monkeypatch.setenv(sh.SMALL_HOST_ENV, "1")
+    d = _decide(FLUX1, available = None, host_commit_mib = 85 * 1024)
+    assert not d.no_swap and d.refuse is None and d.engaged == forced
+    assert d.commit_mib == (85 * 1024 if forced else None)
+
+
+def test_no_swap_zero_keeps_the_default_decision(monkeypatch):
+    args = dict(total = 64 * 1024, available = 58 * 1024, host_commit_mib = 85 * 1024)
+    default = _decide(FLUX1, **args)
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "0")
+    assert _decide(FLUX1, **args) == default
+
+
+@pytest.mark.parametrize("commit", [50 * 1024, None])
+def test_no_swap_image_video_pipeline_reads_each_budget_once_under_the_test_cap(
+    tmp_path, monkeypatch, commit
+):
+    from core.inference import diffusion as dif
+
+    calls = dict(total = 0, available = 0, commit = 0)
+    records = []
+
+    def read(name, value):
+        def reader():
+            calls[name] += 1
+            return value
+
+        return reader
+
+    class _LogSpy:
+        def info(self, event, *args):
+            records.append(event % args if args else event)
+
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    monkeypatch.setenv(sh.HOST_RAM_LIMIT_ENV, "24000")
+    monkeypatch.setattr(dm, "_host_ram_capacity_mib", read("total", WIN_TOTAL))
+    monkeypatch.setattr(dm, "_available_system_memory_mib", read("available", 30 * 1024))
+    monkeypatch.setattr(dm, "_windows_commit_headroom_mib", read("commit", commit))
+    monkeypatch.setattr(dif, "stored_components", lambda snapshot: dict(QWEN_GGUF_COMPANIONS))
+    monkeypatch.setattr(dif, "logger", _LogSpy())
+    d = dif.DiffusionBackend()._small_host_decision(
+        str(tmp_path),
+        {"transformer": object()},
+        types.SimpleNamespace(device = "cuda"),
+        torch.float16,
+        lora_active = False,
+    )
+    assert calls == dict(total = 1, available = 1, commit = 1)
+    assert d.total_mib == d.available_mib == 24000
+    assert d.no_swap == d.engaged == (commit is not None)
+    assert d.commit_mib == (24000 if commit is not None else None)
+    assert d.refuse is None and len(records) == 1 and d.reason in records[0]
+    if commit is not None:
+        assert (
+            "24000 MiB no-swap budget, image+video diffusion (llama models excluded)" in records[0]
+        )
+        assert "source ~16717 MiB" in records[0]

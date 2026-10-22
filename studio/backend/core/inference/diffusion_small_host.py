@@ -5,7 +5,10 @@
 (FLUX.1 at fp16: 35 GB, OOM-killed on a 31 GB host before the planner runs). Engaged only when that dense load would
 not fit: big components load at their stored bf16 (memory-mapped), encoders stream with layerwise casting, a streamed
 denoiser is stored as int8 per-channel weights. ``UNSLOTH_DIFFUSION_SMALL_HOST=0|1`` disables / forces it;
-``UNSLOTH_DIFFUSION_HOST_RAM_CHECK=0`` skips the pre-load refusal.
+``UNSLOTH_DIFFUSION_HOST_RAM_CHECK=0`` skips the pre-load refusal. ``UNSLOTH_DIFFUSION_HOST_RAM_NO_SWAP=1`` caps the
+Windows commit budget at the physical RAM available for image and video diffusion loads; llama/chat loads are
+unaffected. This estimate-based routing policy does not lock pages or prevent paging. LoRA loads keep their dense
+route because the low-memory route cannot carry adapters, even when the capped budget is exceeded.
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ SMALL_HOST_ENV = "UNSLOTH_DIFFUSION_SMALL_HOST"
 HOST_RAM_CHECK_ENV = "UNSLOTH_DIFFUSION_HOST_RAM_CHECK"
 # test hook: caps every host reading the guards take (total, available, commit)
 HOST_RAM_LIMIT_ENV = "UNSLOTH_DIFFUSION_HOST_RAM_LIMIT_MIB"
+# Opt-in budget cap for image/video diffusion; llama/chat loads use a separate loader.
+NO_SWAP_ENV = "UNSLOTH_DIFFUSION_HOST_RAM_NO_SWAP"
 SMALL_HOST_ATTR = "_unsloth_small_host"
 
 _MIB = 1024 * 1024
@@ -48,6 +53,10 @@ def small_host_forced() -> bool:
 
 def host_ram_check_disabled() -> bool:
     return _env(HOST_RAM_CHECK_ENV) in ("0", "off", "false", "no")
+
+
+def no_swap_enabled() -> bool:
+    return _env(NO_SWAP_ENV) in ("1", "on", "true", "yes")
 
 
 _ST_DTYPES = {"BF16": "bfloat16", "F16": "float16", "F32": "float32"}
@@ -199,6 +208,8 @@ class SmallHostDecision:
     route_host_mib: int = 0
     commit_mib: Optional[int] = None
     dense_commit_mib: int = 0
+    # the commit budget was capped at the physical RAM available (NO_SWAP_ENV)
+    no_swap: bool = False
     # component -> stored dtype it loads at (memory-mapped)
     storage_dtypes: dict[str, str] = field(default_factory = dict)
     refuse: Optional[str] = None
@@ -254,18 +265,31 @@ def decide_small_host(
     if host_available_mib is None and not forced:
         return SmallHostDecision(False, "host RAM unreadable", dense_host_mib = dense)
     commit = None if host_commit_mib is None else int(host_commit_mib)
+    no_swap = commit is not None and no_swap_enabled() and host_available_mib is not None
+    if no_swap:
+        # Compare the dense commit estimate with the current physical budget too. This neither locks pages
+        # nor bounds later allocations; the existing LoRA exception still keeps its dense load.
+        commit = min(commit, int(host_available_mib))
     commit_fits = commit is None or dense_commit + reserve <= commit
     fits = (
         host_available_mib is not None
         and dense + reserve <= int(host_available_mib)
         and commit_fits
     )
-    commit_note = (
-        ""
-        if commit is None
-        else f", {commit} MiB commit headroom (dense needs ~{dense_commit} MiB)"
-    )
-    extra = {"commit_mib": commit, "dense_commit_mib": dense_commit}
+    source_mib = int(sum(c.mib for c in converted.values()))
+    if commit is None:
+        commit_note = ""
+    elif no_swap:
+        commit_note = (
+            f", {commit} MiB no-swap budget, image+video diffusion (llama models excluded),"
+            f" source ~{source_mib} MiB (dense needs ~{dense_commit} MiB)"
+        )
+    else:
+        commit_note = (
+            f", {commit} MiB commit headroom, source ~{source_mib} MiB"
+            f" (dense needs ~{dense_commit} MiB)"
+        )
+    extra = {"commit_mib": commit, "dense_commit_mib": dense_commit, "no_swap": no_swap}
     if fits and not forced:
         return SmallHostDecision(
             False,
