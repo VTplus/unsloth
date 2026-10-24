@@ -266,6 +266,7 @@ _CODEX_ENV_UNSET = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
 # via OpenAI. CODEX_ACCESS_TOKEN is not a provider candidate but its host exec tool inherits it
 # (it is absent from host-env-security-policy.json), and the codex CLI on PATH logs in with it.
 _OPENCLAW_ENV_UNSET = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
+_OPENCLAW_PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}", re.IGNORECASE)
 
 # Shared by every agent command; only the config/env/command differ. Help is grouped into rich panels so `--help` reads as Model / Server / Session instead of one long unaligned list.
 _PANEL_MODEL = "Model"
@@ -2147,6 +2148,8 @@ _RESIDENT_RUNTIME_FIELDS = {
     "tensor_parallel": "tensor_parallel",
     "speculative_type": "speculative_type",
     "spec_draft_n_max": "spec_draft_n_max",
+    "requested_reasoning_budget": "reasoning_budget",
+    "requested_reasoning_budget_message": "reasoning_budget_message",
     # The applied value is null when the runtime refused the request.
     # Scheme and width together; a bare width reads back as mx.quantize, so TurboQuant would reload as it. The width stays for servers without mlx_kv_quant.
     "mlx_kv_quant_requested": "mlx_kv_quant",
@@ -6237,10 +6240,21 @@ _JSONC_COMMENT = re.compile(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', re.S)
 _JSONC_TRAILING_COMMA = re.compile(r'("(?:\\.|[^"\\])*")|,(?=\s*[\]}])')
 
 
-def _load_app_config(path: Path, text: Optional[str]) -> Optional[dict]:
+def _load_app_config(
+    path: Path,
+    text: Optional[str],
+    *,
+    allow_json5: bool = False,
+) -> Optional[dict]:
     if text is None or not text.strip():
         return {}
-    if path.suffix == ".toml":
+    if allow_json5:
+        import json5
+
+        # Raw text: the JSONC stripper below misreads // inside single-quoted JSON5 strings.
+        # The json round trip joins surrogate pairs json5 leaves split (UTF-8 can't write them).
+        data = json.loads(json.dumps(json5.loads(text)))
+    elif path.suffix == ".toml":
         try:
             import tomllib  # novermin
         except ImportError:
@@ -6253,7 +6267,6 @@ def _load_app_config(path: Path, text: Optional[str]) -> Optional[dict]:
         import yaml
         data = yaml.safe_load(text)
     else:
-        # OpenCode reads JSONC and OpenClaw JSON5, so accept comments and trailing commas in either.
         text = _JSONC_COMMENT.sub(lambda m: m.group(1) or "", text)
         data = json.loads(_JSONC_TRAILING_COMMA.sub(lambda m: m.group(1) or "", text))
     if not isinstance(data, dict):
@@ -6261,9 +6274,14 @@ def _load_app_config(path: Path, text: Optional[str]) -> Optional[dict]:
     return data
 
 
-def _parse_app_config(path: Path, text: Optional[str]) -> Optional[dict]:
+def _parse_app_config(
+    path: Path,
+    text: Optional[str],
+    *,
+    allow_json5: bool = False,
+) -> Optional[dict]:
     try:
-        return _load_app_config(path, text)
+        return _load_app_config(path, text, allow_json5 = allow_json5)
     except Exception:
         _fail(f"Couldn't parse {path}, so it was left as is. Fix it and re-run.")
 
@@ -6318,8 +6336,14 @@ def _splice_jsonc(text: str, keys: tuple, value) -> str:
     return text[:last] + f"\n{indent}{member}\n" + "  " * depth + text[close:]
 
 
-def _set_app_values(text: Optional[str], path: Path, updates: list) -> Optional[str]:
-    config = _parse_app_config(path, text)
+def _set_app_values(
+    text: Optional[str],
+    path: Path,
+    updates: list,
+    *,
+    allow_json5: bool = False,
+) -> Optional[str]:
+    config = _parse_app_config(path, text, allow_json5 = allow_json5)
     before = json.dumps(config, sort_keys = True)
     for keys, value in updates:
         if value is _APP_DELETE:
@@ -6343,13 +6367,13 @@ def _set_app_values(text: Optional[str], path: Path, updates: list) -> Optional[
         parent[keys[-1]] = value
     if json.dumps(config, sort_keys = True) == before:
         return text
-    if path.suffix != ".yaml":
+    if allow_json5 or path.suffix != ".yaml":
         candidate = text
         with contextlib.suppress(Exception):
             if candidate and candidate.strip():
                 for keys, value in updates:
                     candidate = _splice_jsonc(candidate, keys, value)
-                if _load_app_config(path, candidate) == config:
+                if _load_app_config(path, candidate, allow_json5 = allow_json5) == config:
                     return candidate
         return json.dumps(config, indent = 2, ensure_ascii = False) + "\n"
     import yaml
@@ -6456,6 +6480,8 @@ def _open_app_config(
     if state.get("path") != str(target.path):
         state = {}
     text = _read_app_file(target.path)
+    if target.agent == "openclaw":
+        parse = functools.partial(_parse_app_config, allow_json5 = True)
     parse(target.path, text)
     key, key_id = _app_api_key(target, base, explicit_key, state)
     return state_path, state, text, key, key_id
@@ -6502,7 +6528,10 @@ def _add_app_provider(
     try:
         state_path, state, text, key, key_id = _open_app_config(target, base, explicit_key)
         new_text = _set_app_values(
-            text, target.path, target.updates(text, target.path, base, key, entry)
+            text,
+            target.path,
+            target.updates(text, target.path, base, key, entry),
+            allow_json5 = target.agent == "openclaw",
         )
         new_state = {"path": str(target.path), "base": base, "key": key, "key_id": key_id}
         _save_app_config(target, state_path, state, new_state, text, new_text)
@@ -6778,7 +6807,7 @@ def _openclaw_app_updates(
     entry,
     max_tokens = None,
 ) -> list:
-    config = _parse_app_config(path, text) or {}
+    config = _parse_app_config(path, text, allow_json5 = True) or {}
     agents = config.get("agents")
     defaults = agents.get("defaults") if isinstance(agents, dict) else None
     defaults = defaults if isinstance(defaults, dict) else {}
@@ -6802,8 +6831,51 @@ def _openclaw_app_updates(
     return changes
 
 
+def _openclaw_config_file() -> Optional[str]:
+    executable = _which_with_install_dirs("openclaw")
+    if executable is None:
+        return None
+    try:
+        output = subprocess.check_output(
+            [executable, "config", "file"],
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+            timeout = 60,
+            stderr = subprocess.DEVNULL,
+            env = _probe_env(),
+        )
+    except Exception:
+        return None
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1] if lines and os.path.isabs(lines[-1]) else None
+
+
 def _openclaw_app_target(max_tokens: Optional[int] = None) -> _AppTarget:
-    path = Path.home() / ".openclaw" / "openclaw.json"
+    home = Path.home()
+
+    def user_path(value: str) -> Path:
+        # Only a leading ~ expands (against OPENCLAW_HOME); abspath keeps symlinks for _read_app_file to refuse.
+        if value == "~":
+            value = str(home)
+        elif value.startswith(("~/", "~\\")):
+            value = os.path.join(str(home), value[2:])
+        return Path(os.path.abspath(value))
+
+    override = os.environ.get("OPENCLAW_HOME", "").strip()
+    if override and override not in ("null", "undefined"):
+        home = user_path(override)
+    if override := os.environ.get("OPENCLAW_CONFIG_PATH", "").strip():
+        path = user_path(override)
+    elif override := os.environ.get("OPENCLAW_STATE_DIR", "").strip():
+        path = user_path(override) / "openclaw.json"
+    else:
+        path = home / ".openclaw" / "openclaw.json"
+        profile = os.environ.get("OPENCLAW_PROFILE", "").strip()
+        # Whether a named profile alone moves the config depends on the build (openclaw#133252, after 2026.10.10-beta.3), so ask OpenClaw.
+        if _OPENCLAW_PROFILE_RE.fullmatch(profile) and profile.lower() != "default":
+            if (active := _openclaw_config_file()) is not None:
+                path = Path(active)
     updates = functools.partial(_openclaw_app_updates, max_tokens = max_tokens)
     return _AppTarget("openclaw", "OpenClaw app", path, updates)
 
