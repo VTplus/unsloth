@@ -22,6 +22,7 @@ from typing import Optional, Tuple, List, Union
 from ._utils import *
 from ._utils import apply_unsloth_gradient_checkpointing
 from ._utils import _ignore_block_swap_params_for_ddp
+from ._utils import _refuse_tensor_parallel_for_inference
 from ._utils import __version__, importlib_version
 from ._utils import move_to_device
 from ._utils import per_layer_device
@@ -996,9 +997,9 @@ def LlamaAttention_fast_forward(
         del self.attention
     bsz, q_len, _ = hidden_states.size()
 
-    n_heads = self.config.num_attention_heads
+    n_heads = self.__dict__.get("_unsloth_tp_heads", self.config.num_attention_heads)
     n_groups = self.num_key_value_groups
-    n_kv_heads = self.config.num_key_value_heads
+    n_kv_heads = self.__dict__.get("_unsloth_tp_kv_heads", self.config.num_key_value_heads)
     head_dim = self.head_dim
     assert n_kv_heads * n_groups == n_heads
 
@@ -4295,6 +4296,10 @@ class FastLlamaModel:
             "    try:\n"
             "        from unsloth.models._utils import _unsloth_reset_stray_compile_cache as _unsloth_reset_cc\n"
             "        _unsloth_reset_cc(self)\n"
+            "    except Exception: pass\n"
+            "    try:\n"
+            "        from unsloth.models._utils import _unsloth_non_blocking_batches\n"
+            "        _unsloth_non_blocking_batches(self)\n"
             "    except Exception: pass",
             1,
         )
@@ -5341,6 +5346,7 @@ class FastLlamaModel:
             raise TypeError(
                 "Unsloth: I think you're passing a tokenizer, not the model to for_inference!"
             )
+        _refuse_tensor_parallel_for_inference(model)
 
         def _for_inference(m):
             if hasattr(m, "gradient_checkpointing"):

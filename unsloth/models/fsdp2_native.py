@@ -1645,11 +1645,12 @@ def native_clip_grad_norm_(
             else:
                 # complex grads give real norms; every rank must gather the same dtype.
                 norm_dtype = dtype.to_real() if dtype.is_complex else dtype
-                values = torch.full(
-                    (len(idx),), math.inf if p < 0 else 0.0, device = device, dtype = norm_dtype
-                )
-                if live:
-                    values[torch.tensor(live, device = device)] = torch.stack(norms).to(device)
+                # Host-side interleave: torch.tensor(live, device = cuda) was a blocking H2D copy per step.
+                fill = torch.full((), math.inf if p < 0 else 0.0, device = device, dtype = norm_dtype)
+                slots = [fill] * len(idx)
+                for k, n in zip(live, norms):
+                    slots[k] = n.to(device = device, dtype = norm_dtype)
+                values = torch.stack(slots)
             chunks.append(values)
         return chunks
 
@@ -3460,6 +3461,16 @@ def _refuse_tensor_parallel_model(model):
     except ImportError:
         pass
     dtensor = DTensor is not None and any(isinstance(p, DTensor) for p in model.parameters())
+    # Any level or module (the marker sits on every wrapper level apply_tensor_parallel was given or below).
+    if any(
+        m.__dict__.get("_unsloth_tp") or m.__dict__.get("_unsloth_tp_style")
+        for m in model.modules()
+    ):
+        raise RuntimeError(
+            "Unsloth: native FSDP2 does not compose with Unsloth tensor parallelism "
+            "(apply_tensor_parallel) yet; train a tensor parallel model with a custom loop over the tp "
+            "ranks only (data parallel size 1)."
+        )
     if (tp_size or 1) > 1 or dtensor:
         raise RuntimeError(
             "Unsloth: native FSDP2 got a model that is already distributed (tensor-parallel tp_plan, "
