@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import re
 import struct
 import sys
 import types
@@ -504,10 +503,24 @@ def test_no_swap_boundary_need_equal_to_the_physical_budget(monkeypatch):
     stored = sum(c.mib for c in (FLUX1["transformer"], FLUX1["text_encoder_2"]))
     dense = int(stored * sh._CONVERT_MARGIN)
     need = dense + int(stored * sh._CONVERT_MARGIN) + sh.host_reserve_mib(64 * 1024)
+    # Absolute pin: FLUX1 stores 31783 MiB in the two commit-charged components, the 1.15 conversion
+    # margin charges 36550 MiB twice, and the reserve for a 64 GiB host is 6553 MiB. A constant change
+    # must be a deliberate, visible test change.
+    assert need == 79653
     fits = _decide(FLUX1, total = 64 * 1024, available = need, host_commit_mib = 90 * 1024)
     assert not fits.engaged and fits.no_swap and fits.commit_mib == need
     routes = _decide(FLUX1, total = 64 * 1024, available = need - 1, host_commit_mib = 90 * 1024)
     assert routes.engaged and routes.no_swap and routes.refuse is None
+
+
+def test_no_swap_cap_does_not_bind_above_the_physical_budget(monkeypatch):
+    # The option is active, but the commit headroom is already below the physical budget:
+    # the cap changes nothing and the reason keeps the plain commit headroom wording.
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    d = _decide(FLUX1, total = 64 * 1024, available = 100 * 1024, host_commit_mib = 85 * 1024)
+    assert not d.engaged and d.refuse is None
+    assert d.no_swap and d.commit_mib == 85 * 1024
+    assert "commit headroom" in d.reason and "no-swap budget" not in d.reason
 
 
 def test_no_swap_leaves_the_no_commit_reading_path_untouched(monkeypatch):
@@ -603,7 +616,48 @@ def test_no_swap_image_video_pipeline_reads_each_budget_once_under_the_test_cap(
     assert d.commit_mib == (24000 if commit is not None else None)
     assert d.refuse is None and len(records) == 1 and d.reason in records[0]
     if commit is not None:
-        assert (
-            "24000 MiB no-swap budget, image+video diffusion (llama models excluded)" in records[0]
-        )
+        # The test hook caps the commit reading to the same limit as the physical budget, so the
+        # no-swap cap never binds here and the reason keeps the plain headroom wording.
+        assert "24000 MiB commit headroom" in records[0]
         assert "source ~16717 MiB" in records[0]
+
+
+def test_no_swap_image_video_pipeline_logs_the_bound_cap_when_the_limit_is_not_binding(
+    tmp_path, monkeypatch
+):
+    from core.inference import diffusion as dif
+
+    calls = dict(total = 0, available = 0, commit = 0)
+    records = []
+
+    def read(name, value):
+        def reader():
+            calls[name] += 1
+            return value
+
+        return reader
+
+    class _LogSpy:
+        def info(self, event, *args):
+            records.append(event % args if args else event)
+
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    # The hook only clips: with the limit above the commit headroom the cap binds again.
+    monkeypatch.setenv(sh.HOST_RAM_LIMIT_ENV, str(100 * 1024))
+    monkeypatch.setattr(dm, "_host_ram_capacity_mib", read("total", WIN_TOTAL))
+    monkeypatch.setattr(dm, "_available_system_memory_mib", read("available", 30 * 1024))
+    monkeypatch.setattr(dm, "_windows_commit_headroom_mib", read("commit", 50 * 1024))
+    monkeypatch.setattr(dif, "stored_components", lambda snapshot: dict(QWEN_GGUF_COMPANIONS))
+    monkeypatch.setattr(dif, "logger", _LogSpy())
+    d = dif.DiffusionBackend()._small_host_decision(
+        str(tmp_path),
+        {"transformer": object()},
+        types.SimpleNamespace(device = "cuda"),
+        torch.float16,
+        lora_active = False,
+    )
+    assert calls == dict(total = 1, available = 1, commit = 1)
+    assert d.total_mib == WIN_TOTAL and d.available_mib == 30 * 1024
+    assert d.no_swap and d.engaged and d.commit_mib == 30 * 1024
+    assert "30720 MiB no-swap budget, image+video diffusion (llama models excluded)" in records[0]
+    assert "source ~16717 MiB" in records[0]

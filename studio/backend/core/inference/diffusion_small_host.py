@@ -215,7 +215,7 @@ class SmallHostDecision:
     route_host_mib: int = 0
     commit_mib: Optional[int] = None
     dense_commit_mib: int = 0
-    # the commit budget was capped at the physical RAM available (NO_SWAP_ENV)
+    # NO_SWAP_ENV active (both readings known); commit budget = min(headroom, available)
     no_swap: bool = False
     # component -> stored dtype it loads at (memory-mapped)
     storage_dtypes: dict[str, str] = field(default_factory = dict)
@@ -277,6 +277,7 @@ def decide_small_host(
         return SmallHostDecision(False, "host RAM unreadable", dense_host_mib = dense)
     commit = None if host_commit_mib is None else int(host_commit_mib)
     no_swap = commit is not None and no_swap_enabled() and host_available_mib is not None
+    no_swap_bound = no_swap and commit > int(host_available_mib)
     if no_swap:
         # Compare the dense commit estimate with the current physical budget too. This neither locks pages
         # nor bounds later allocations; the existing LoRA exception still keeps its dense load.
@@ -290,9 +291,14 @@ def decide_small_host(
     source_mib = int(sum(c.mib for c in converted.values()))
     if commit is None:
         commit_note = ""
-    elif no_swap:
+    elif no_swap_bound:
         commit_note = (
             f", {commit} MiB no-swap budget, image+video diffusion (llama models excluded),"
+            f" source ~{source_mib} MiB (dense needs ~{dense_commit} MiB)"
+        )
+    elif no_swap:
+        commit_note = (
+            f", {commit} MiB commit headroom (no-swap, cap not binding),"
             f" source ~{source_mib} MiB (dense needs ~{dense_commit} MiB)"
         )
     else:
