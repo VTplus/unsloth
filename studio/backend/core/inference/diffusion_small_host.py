@@ -6,9 +6,10 @@
 not fit: big components load at their stored bf16 (memory-mapped), encoders stream with layerwise casting, a streamed
 denoiser is stored as int8 per-channel weights. ``UNSLOTH_DIFFUSION_SMALL_HOST=0|1`` disables / forces it;
 ``UNSLOTH_DIFFUSION_HOST_RAM_CHECK=0`` skips the pre-load refusal. ``UNSLOTH_DIFFUSION_HOST_RAM_NO_SWAP=1`` caps the
-Windows commit budget at the physical RAM available for image and video diffusion loads; llama/chat loads are
-unaffected. This estimate-based routing policy does not lock pages or prevent paging. LoRA loads keep their dense
-route because the low-memory route cannot carry adapters, even when the capped budget is exceeded.
+Windows commit budget at the physical RAM available for image and video diffusion loads (pipeline, GGUF and single-file
+converter loads); llama/chat loads are unaffected. This estimate-based routing policy does not lock pages or prevent
+paging. LoRA loads keep their dense route because the low-memory route cannot carry adapters, even when the capped
+budget is exceeded.
 """
 
 from __future__ import annotations

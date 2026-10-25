@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from core.inference import diffusion_comfy_quant as cq
+from core.inference import diffusion_memory as dm
 from core.inference import diffusion_single_file_converters as conv
 from core.inference import diffusion_small_host as small_host
 
@@ -70,6 +71,17 @@ def _host(
     total_mib = 32768,
 ):
     monkeypatch.setattr(small_host, "host_ram_mib", lambda: (total_mib, available_mib))
+
+
+@pytest.fixture(autouse = True)
+def _clean_no_swap(monkeypatch):
+    # The no-swap cap reads this env; a globally exported value must not change the physical-budget tests.
+    monkeypatch.delenv(small_host.NO_SWAP_ENV, raising = False)
+
+
+def _no_swap(monkeypatch, commit_mib):
+    monkeypatch.setenv(small_host.NO_SWAP_ENV, "1")
+    monkeypatch.setattr(small_host, "host_commit_mib", lambda: commit_mib)
 
 
 def _no_read(monkeypatch):
@@ -267,3 +279,67 @@ def test_a_file_that_fits_only_stored_loads_with_fp8_storage_and_is_refused_wide
     monkeypatch.setenv(cq.FP8_STORAGE_ENV, "0")
     with pytest.raises(RuntimeError, match = "Not enough system RAM"):
         load(fp8_storage = cq.comfy_fp8_storage(None))
+
+
+def test_no_swap_caps_the_up_front_estimate_at_the_commit_headroom(tmp_path, monkeypatch, krea2):
+    """NO_SWAP on Windows caps this load at min(available, commit): plenty of free RAM, tiny headroom."""
+    path, _ = _write(tmp_path, "fp8")
+    _host(monkeypatch, available_mib = 64 * 1024)
+    _no_swap(monkeypatch, 1)
+    _no_read(monkeypatch)
+    with pytest.raises(RuntimeError, match = "no-swap budget"):
+        conv.load_original_layout_transformer(krea2, str(path), dict(_KWARGS))
+
+
+def test_no_swap_off_keeps_the_physical_budget(tmp_path, monkeypatch, krea2):
+    """Without the option the same load ignores the tiny commit headroom entirely."""
+    path, _ = _write(tmp_path, "fp8")
+    _host(monkeypatch, available_mib = 64 * 1024)
+    monkeypatch.setattr(small_host, "host_commit_mib", lambda: 1)
+    model = conv.load_original_layout_transformer(krea2, str(path), dict(_KWARGS))
+    assert model.transformer_blocks[0].attn.to_q.weight.dtype == torch.bfloat16
+
+
+def test_no_swap_without_a_commit_reading_stays_unchanged(tmp_path, monkeypatch, krea2):
+    """Linux / macOS read no commit headroom: the option must not change the physical budget."""
+    path, _ = _write(tmp_path, "fp8")
+    _host(monkeypatch, available_mib = 64 * 1024)
+    _no_swap(monkeypatch, None)
+    model = conv.load_original_layout_transformer(krea2, str(path), dict(_KWARGS))
+    assert model.transformer_blocks[0].attn.to_q.weight.dtype == torch.bfloat16
+
+
+def test_no_swap_caps_the_live_charges_too(monkeypatch):
+    """The per-allocation charge re-reads free memory; the cap must still bind there."""
+    _host(monkeypatch, available_mib = 64 * 1024)
+    _no_swap(monkeypatch, 1)
+    budget = conv.HostRamBudget("widen.safetensors", "widening its weights", None)
+    budget.armed = True
+    with pytest.raises(RuntimeError, match = "no-swap budget"):
+        budget.charge(4 * conv._MIB)
+
+
+def test_no_swap_cap_does_not_bind_above_the_physical_budget(tmp_path, monkeypatch, krea2):
+    """With the option on but the commit headroom above the physical budget, the physical budget keeps
+    binding and the refusal carries no no-swap note (same contract as the decision path)."""
+    path, _ = _write(tmp_path, "fp8")
+    _host(monkeypatch, available_mib = 2048)  # under the 3 GB reserve alone
+    _no_swap(monkeypatch, 128 * 1024)
+    _no_read(monkeypatch)
+    with pytest.raises(RuntimeError) as excinfo:
+        conv.load_original_layout_transformer(krea2, str(path), dict(_KWARGS))
+    assert "Not enough system RAM to load krea2_fp8" in str(excinfo.value)
+    assert "no-swap budget" not in str(excinfo.value)
+
+
+def test_no_swap_converter_cap_honours_the_limit_env_hook(tmp_path, monkeypatch, krea2):
+    """HOST_RAM_LIMIT_ENV clips the commit reading before the cap uses it (same hook as the decision
+    path): a large real headroom clipped to 2 GB binds even with 64 GB free."""
+    path, _ = _write(tmp_path, "fp8")
+    _host(monkeypatch, available_mib = 64 * 1024)
+    monkeypatch.setattr(dm, "_windows_commit_headroom_mib", lambda: 100 * 1024)
+    monkeypatch.setenv(small_host.HOST_RAM_LIMIT_ENV, str(2048))
+    monkeypatch.setenv(small_host.NO_SWAP_ENV, "1")
+    with pytest.raises(RuntimeError) as excinfo:
+        conv.load_original_layout_transformer(krea2, str(path), dict(_KWARGS))
+    assert "no-swap budget caps this load at 2.0 GB" in str(excinfo.value)

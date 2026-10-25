@@ -129,6 +129,9 @@ def test_windows_commit_headroom_routes_a_dense_load_that_fits_physical_ram():
         QWEN_GGUF_COMPANIONS, total = WIN_TOTAL, available = 30 * 1024, host_commit_mib = 50 * 1024
     )
     assert not d.engaged and "commit headroom" in d.reason
+    # the default path (NO_SWAP off) carries the same source/dense wording as the no-swap branches;
+    # the 242 MiB vae stays below _STREAM_MIN_MIB, so source counts the 16717 MiB encoder only
+    assert "source ~16717 MiB (dense needs ~38448 MiB)" in d.reason
 
 
 def test_pread_read_components_need_no_source_view_commit():
@@ -552,6 +555,22 @@ def test_no_swap_keeps_the_dense_image_video_lora_exception(monkeypatch):
     assert "LoRA" in d.reason and "no-swap budget" in d.reason
 
 
+def test_no_swap_pread_components_keep_the_cap_on_the_converted_copy(monkeypatch):
+    # A component read through pread holds no source view (see the default-path pread test above): under
+    # NO_SWAP the capped budget must still fit the pread variant while the mmap-read variant routes.
+    # Pins the combination of both switches on the merged Windows stand.
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    te_pread = sh.StoredComponent("text_encoder", 16717, "bfloat16", 0, "transformers")
+    comps = {"text_encoder": te_pread, "vae": QWEN_GGUF_COMPANIONS["vae"]}
+    args = dict(total = WIN_TOTAL, available = 30 * 1024, host_commit_mib = 50 * 1024)
+    mapped = _decide(QWEN_GGUF_COMPANIONS, **args)
+    read = _decide(comps, **args, pread_libraries = ("transformers",))
+    assert mapped.engaged and mapped.no_swap and "no-swap budget" in mapped.reason
+    assert not read.engaged and read.no_swap
+    assert read.commit_mib == 30 * 1024 and "no-swap budget" in read.reason
+    assert read.dense_commit_mib == read.dense_host_mib
+
+
 @pytest.mark.parametrize("commit", [0, 20 * 1024])
 def test_no_swap_preserves_a_smaller_or_exhausted_commit_budget(monkeypatch, commit):
     monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
@@ -622,7 +641,7 @@ def test_no_swap_image_video_pipeline_reads_each_budget_once_under_the_test_cap(
         assert "source ~16717 MiB" in records[0]
 
 
-def test_no_swap_image_video_pipeline_logs_the_bound_cap_when_the_limit_is_not_binding(
+def test_no_swap_image_video_pipeline_logs_the_bound_cap_when_the_test_limit_does_not_bind(
     tmp_path, monkeypatch
 ):
     from core.inference import diffusion as dif

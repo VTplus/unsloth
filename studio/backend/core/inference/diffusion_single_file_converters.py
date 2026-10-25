@@ -438,7 +438,12 @@ class HostRamBudget:
     is refused when that allocation plus the small-host reserve exceeds the host's LIVE available memory,
     instead of the OOM that ends the whole server. Live, not a running total: buffers the load has
     already freed are back in the next reading, and copies made where nothing checks still show up in
-    it. ``UNSLOTH_DIFFUSION_HOST_RAM_CHECK=0`` disables both checks."""
+    it. ``UNSLOTH_DIFFUSION_HOST_RAM_CHECK=0`` disables both checks.
+
+    With ``UNSLOTH_DIFFUSION_HOST_RAM_NO_SWAP=1`` the Windows commit headroom caps this budget at
+    ``min(available, commit)`` for image and video diffusion single-file loads - the same contract the
+    pipeline and GGUF decision applies in ``decide_small_host``; Linux / macOS read no commit headroom
+    and stay unchanged."""
 
     def __init__(
         self,
@@ -447,14 +452,17 @@ class HostRamBudget:
         logger: Any = None,
     ) -> None:
         from .diffusion_small_host import (
+            host_commit_mib,
             host_ram_check_disabled,
             host_ram_mib,
             host_reserve_mib,
+            no_swap_enabled,
         )
 
         self.path, self.why, self.logger = path, why, logger
         self._token = None
         self.available_mib: Optional[int] = None
+        self.commit_mib: Optional[int] = None
         self.reserve_mib = 0
         self.armed = False
         self.requested = (
@@ -470,6 +478,15 @@ class HostRamBudget:
             return
         self.available_mib = int(available)
         self.reserve_mib = host_reserve_mib(total)
+        # No-swap policy (same contract as decide_small_host): cap the budget at the Windows commit
+        # headroom, read once per load. Linux / macOS read None and keep the physical budget.
+        if no_swap_enabled():
+            try:
+                commit = host_commit_mib()
+            except Exception:  # noqa: BLE001 -- unreadable commit reading means no cap, like a None reading on both paths
+                commit = None
+            if commit is not None:
+                self.commit_mib = int(commit)
         # Armed by the file size here, and by the widened estimate in ``check``: a 900 MiB nvfp4 file widens
         # to 3.6 GiB of bf16. Only a load small on disk AND in its estimate is never checked.
         try:
@@ -481,16 +498,23 @@ class HostRamBudget:
     def _refuse_if_over(self, need_bytes: int, available_mib: int, at_least: bool) -> None:
         from .diffusion_small_host import HOST_RAM_CHECK_ENV
 
+        budget_mib = available_mib if self.commit_mib is None else min(available_mib, self.commit_mib)
         need_mib = -(-int(need_bytes) // _MIB)
-        if need_mib + self.reserve_mib <= available_mib:
+        if need_mib + self.reserve_mib <= budget_mib:
             return
         reserve = self.reserve_mib
         name = os.path.basename(str(self.path))
+        cap_note = ""
+        if self.commit_mib is not None and self.commit_mib < available_mib:
+            cap_note = (
+                f"; the no-swap budget caps this load at {self.commit_mib / 1024:.1f} GB of commit"
+                f" headroom for image+video diffusion"
+            )
         message = (
             f"Not enough system RAM to load {name}: {self.why} needs "
             f"{'at least' if at_least else 'about'} {(need_mib + reserve) / 1024:.1f} GB of free host "
             f"memory ({need_mib / 1024:.1f} GB of weights + {reserve / 1024:.1f} GB reserve) and "
-            f"{available_mib / 1024:.1f} GB is free. Close other applications, use a GGUF or a "
+            f"{available_mib / 1024:.1f} GB is free{cap_note}. Close other applications, use a GGUF or a "
             f"smaller quant of this model, or set {HOST_RAM_CHECK_ENV}=0 to try anyway."
         )
         if self.logger is not None:
