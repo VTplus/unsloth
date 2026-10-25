@@ -569,6 +569,9 @@ def test_no_swap_pread_components_keep_the_cap_on_the_converted_copy(monkeypatch
     assert not read.engaged and read.no_swap
     assert read.commit_mib == 30 * 1024 and "no-swap budget" in read.reason
     assert read.dense_commit_mib == read.dense_host_mib
+    # the pread-read encoder holds no source view, so the source figure excludes it
+    assert "source ~16717 MiB" in mapped.reason
+    assert "source ~0 MiB" in read.reason
 
 
 @pytest.mark.parametrize("commit", [0, 20 * 1024])

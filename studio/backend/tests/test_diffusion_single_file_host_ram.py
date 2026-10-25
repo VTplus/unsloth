@@ -345,6 +345,21 @@ def test_no_swap_converter_cap_honours_the_limit_env_hook(tmp_path, monkeypatch,
     assert "no-swap budget caps this load at 2.0 GB" in str(excinfo.value)
 
 
+def test_no_swap_cap_keeps_the_fp8_widen_reserve(tmp_path, monkeypatch, krea2):
+    """NO_SWAP and the fp8-widen reserve compose: the capped budget refuses with the capped reserve and
+    names the no-swap reason (merge point of #14758 and the no-swap delta)."""
+    path, _ = _write(tmp_path, "fp8")
+    _host(monkeypatch, available_mib = 64 * 1024, total_mib = 64 * 1024)
+    _no_swap(monkeypatch, 1024)
+    budget = conv.HostRamBudget(
+        str(path), "widening its weights to bfloat16", None, fp8_widen_chosen = True
+    )
+    assert budget.reserve_mib == cq.FP8_STORAGE_HOST_RESERVE_MIB
+    assert budget.commit_mib == 1024
+    with pytest.raises(RuntimeError, match = "no-swap budget"):
+        budget.check(4 * conv._MIB)
+
+
 _GIB = 1024
 _KREA2_WIDENED_MIB = 24 * _GIB  # Krea 2 fp8 widened to bf16
 
