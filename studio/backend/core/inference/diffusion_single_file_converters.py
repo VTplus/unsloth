@@ -505,7 +505,9 @@ class HostRamBudget:
     def _refuse_if_over(self, need_bytes: int, available_mib: int, at_least: bool) -> None:
         from .diffusion_small_host import HOST_RAM_CHECK_ENV
 
-        budget_mib = available_mib if self.commit_mib is None else min(available_mib, self.commit_mib)
+        budget_mib = (
+            available_mib if self.commit_mib is None else min(available_mib, self.commit_mib)
+        )
         need_mib = -(-int(need_bytes) // _MIB)
         if need_mib + self.reserve_mib <= budget_mib:
             return

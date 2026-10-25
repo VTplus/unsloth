@@ -298,9 +298,7 @@ def decide_small_host(
         and dense + reserve <= int(host_available_mib)
         and commit_fits
     )
-    source_mib = int(
-        sum(c.mib for c in converted.values() if c.library not in pread_libraries)
-    )
+    source_mib = int(sum(c.mib for c in converted.values() if c.library not in pread_libraries))
     if commit is None:
         commit_note = ""
     elif no_swap_bound:
