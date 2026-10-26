@@ -30,6 +30,8 @@ export interface DiffusionResolvedControl {
 export interface DiffusionStatus {
   loaded: boolean;
   repo_id: string | null;
+  // False when the resident belongs to another account this one may not use; the status then omits repo_id.
+  yours?: boolean;
   display_repo_id?: string | null;
   resident_mib?: number | null;
   family: string | null;

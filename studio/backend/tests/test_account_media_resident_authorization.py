@@ -445,3 +445,81 @@ def test_restoring_residency_records_is_a_noop_once_another_load_took_them(monke
     assert run_as(ALICE, access.restore_resident_metadata, "diffusion") is False
     assert access._resident_accounts["diffusion"][0] == BOB.account_id
     assert access._resident_components["diffusion"] == ("b/model", frozenset({"bob/private-lora"}))
+
+
+def test_a_successful_load_grants_the_generate_components_to_the_loading_account(monkeypatch):
+    """A cached gated base loads (200) but generate re-checks it; the load must grant it."""
+    status = {
+        "loaded": True,
+        "repo_id": "org/public-model",
+        "family": "z-image",
+        "base_repo": "krea/Krea-2-Turbo",
+    }
+    _install_backend(
+        monkeypatch,
+        lambda: status,
+        lambda **kwargs: _result("org/public-model"),
+    )
+    run_as(
+        BOB, access.note_resident_components, "diffusion", "org/public-model", "bob/private-lora"
+    )
+    run_as(BOB, access.grant_resident_components, status, "diffusion")
+    assert run_as(BOB, access.model_grants) == {
+        "model:org/public-model",
+        "model:krea/krea-2-turbo",
+        "model:bob/private-lora",
+    }
+    with client_for(BOB) as client:
+        assert (
+            client.post("/api/inference/images/generate", json = {"prompt": "a sloth"}).status_code
+            == 200
+        )
+    with client_for(ALICE) as client:
+        assert (
+            client.post("/api/inference/images/generate", json = {"prompt": "a sloth"}).status_code
+            == 404
+        )
+
+
+def test_a_local_base_is_never_granted():
+    status = {
+        "loaded": True,
+        "repo_id": "org/public-model",
+        "family": "z-image",
+        "base_repo": "E:\\models\\krea-2",
+    }
+    run_as(BOB, access.grant_resident_components, status, "diffusion")
+    assert run_as(BOB, access.model_grants) == {"model:org/public-model"}
+
+
+def test_a_failed_load_grants_nothing(monkeypatch):
+    """The grant is written on commit only; the failure rollback leaves no grant behind."""
+    monkeypatch.setattr(access, "_prior_resident_accounts", {})
+    monkeypatch.setattr(access, "_uncommitted_resident", {}, raising = False)
+    monkeypatch.setattr(access, "_uncommitted_components", {}, raising = False)
+    run_as(BOB, access.note_resident_account, "diffusion", "org/public-model")
+    run_as(
+        BOB,
+        access.note_resident_components,
+        "diffusion",
+        "org/public-model",
+        "krea/Krea-2-Turbo",
+    )
+    assert run_as(BOB, access.restore_resident_metadata, "diffusion") is True
+    assert run_as(BOB, access.model_grants) == set()
+
+
+def test_the_load_grants_only_after_the_resident_commits():
+    """A failed load must not grant: the call sits after the commit and inside its guard."""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "core/inference/diffusion.py"
+    ).read_text(encoding = "utf-8")
+    commit = source.index("state_committed = True")
+    guard = source.index("if state_committed:", commit)
+    grant = source.index("grant_resident_components(self.status()", guard)
+    assert commit < guard < grant
+    guard_indent = len(source[:guard].rsplit("\n", 1)[-1])
+    grant_indent = len(source[:grant].rsplit("\n", 1)[-1])
+    assert grant_indent > guard_indent

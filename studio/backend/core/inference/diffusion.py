@@ -10756,6 +10756,13 @@ class DiffusionBackend:
                         self._state = state
                         state_committed = True
                         commit_load_budget_fraction("image")
+                    if state_committed:
+                        # The successful load proves this account's access; generate re-checks these components.
+                        try:
+                            from hub.services.models import account_access
+                            account_access.grant_resident_components(self.status(), "diffusion")
+                        except Exception:  # noqa: BLE001 - bookkeeping never fails a load
+                            logger.debug("resident component grant failed", exc_info = True)
                     try:
                         from . import diffusion_vae_prebuild
                         diffusion_vae_prebuild.maybe_kick(pipe, compile_ctx, logger)

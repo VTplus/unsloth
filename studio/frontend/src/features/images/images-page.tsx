@@ -4,6 +4,7 @@
 import { generationFailureLogsAction } from "@/features/settings/lib/view-logs-action";
 import { isRetiredCopySnapshot, readImageModel, retiredSnapshotAsLoaded, rememberImageModel, matchesRememberedModel, componentFilesMatch, componentFieldsOwnerAfterLoad, componentFilesForModel, forgetStaleImageComponents, forgetStaleResidentComponents, recalledComponentFiles, reconcileRememberedComponents, rememberLoadedImageComponents, recoveredComponentFields, seedImageComponents, rememberPendingImageLoad, clearPendingImageLoad, finishedLoadTarget, type ImageComponentFiles, type ImageModelKey, type RememberedImageModel } from "./image-model-recall";
 import { componentFileFields, splitComponentFileList } from "./component-files";
+import { FOREIGN_RESIDENT_NOTICE, blocksLocalGenerate, canCompareOnResident } from "./lib/foreign-resident";
 import type { CompareContext } from "./compare/compare-axes";
 import type { CompareRun } from "./compare/compare-run";
 // Statically imported: this page is already its own lazy chunk, and a nested import() of the panel split modules
@@ -5379,7 +5380,7 @@ export function ImagesPage({
     },
     [busy, handleGenerate, imagePresets.hydrated],
   );
-  const compareAvailable = !external && Boolean(status?.loaded) && workflow === "create";
+  const compareAvailable = canCompareOnResident(status, external, workflow);
   const compareSdControls = sdCaps;
   const compareContext = useMemo<CompareContext>(
     () => ({
@@ -5414,6 +5415,10 @@ export function ImagesPage({
     if (busy !== null || !imagePresets.hydrated) return;
     if (external) {
       await handleGenerate();
+      return;
+    }
+    if (blocksLocalGenerate(status, external)) {
+      toast.info(FOREIGN_RESIDENT_NOTICE);
       return;
     }
     if (status?.loaded) {
@@ -6898,6 +6903,11 @@ export function ImagesPage({
           </div>
           {/* The scroll mask provides the fade; leave the footer unpainted to avoid dark-mode banding. */}
           <div className="relative z-10 flex shrink-0 flex-wrap justify-center gap-2 px-4 pt-0.5 pb-3">
+            {blocksLocalGenerate(status, external) && (
+              <p className="w-full text-center text-xs text-muted-foreground">
+                {FOREIGN_RESIDENT_NOTICE}
+              </p>
+            )}
             {busy === "generating" ? (
               <Button
                 className="relative z-10 text-ui-13 hover:bg-muted dark:hover:bg-muted"
@@ -6912,7 +6922,7 @@ export function ImagesPage({
                 <Button variant="dark"
                   className="relative z-10 text-ui-13 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
                   onClick={handleGenerateWithRecall}
-                  disabled={busy !== null || !imagePresets.hydrated || (!status?.loaded && !rememberedModel && !external)}
+                  disabled={busy !== null || !imagePresets.hydrated || blocksLocalGenerate(status, external) || (!status?.loaded && !rememberedModel && !external)}
                 >
                   Generate
                 </Button>

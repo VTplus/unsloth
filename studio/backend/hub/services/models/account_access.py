@@ -756,6 +756,41 @@ def record_model_grant(repo_id: str, repo_type: str = "model") -> None:
         _write_grant(path, _grant_key(repo_id, repo_type))
 
 
+def _is_hub_reference(reference: str) -> bool:
+    """A Hub-shaped id: no drive, backslash, UNC or leading path prefix.
+
+    A relative two-segment path such as ``models/krea`` is indistinguishable from
+    ``org/name`` without touching the filesystem; such a grant key matches no real
+    model check and is harmless.
+    """
+    ref = (reference or "").strip()
+    return (
+        bool(ref)
+        and "/" in ref
+        and "\\" not in ref
+        and not ref.startswith((".", "/", "~"))
+        and ":" not in ref[:3]
+    )
+
+
+def grant_resident_components(status: dict, modality: str | None = None) -> None:
+    """Grant the loading account every component a later generate may re-check.
+
+    A grant is only recorded when a download completes, so a model already in the
+    cache would load and then refuse to generate. The successful load proves this
+    account's access: grant the status identities (repo id and the resolved base)
+    plus the components the load recorded, a superset of what generate re-checks.
+    """
+    if not managed_account():
+        return
+    references = list(resident_components(status, modality))
+    primary, components = _resident_components.get(modality or "", ("", frozenset()))
+    references.extend([primary, *sorted(components)])
+    for reference in dict.fromkeys(r for r in references if isinstance(r, str) and r):
+        if _is_hub_reference(reference):
+            record_model_grant(reference)
+
+
 def _write_grant(path: Path, key: str) -> None:
     with closing(connect_studio_db(path, timeout = 5.0)) as conn, conn:
         conn.execute(
