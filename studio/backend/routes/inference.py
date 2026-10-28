@@ -58,6 +58,7 @@ from utils.account_context import (
 )
 from utils.security.consent import MANAGED_REMOTE_CODE_REFUSAL, managed_remote_code_refused
 from loggers import get_logger
+from utils.scan_memo import in_scan_memo
 from loggers.media_progress import (
     log_media_generation_progress,
     log_media_load_progress,
@@ -130,6 +131,7 @@ from core.inference.audio_errors import (
 )
 from core.inference.audio_cpp_outputs import NO_STEMS
 from core.inference import context_refusal
+from core.inference.gen_stepper import ThreadStepper
 from core.inference.context_window import (
     estimate_message_tokens as _estimate_message_tokens,
     estimate_messages_tokens as _estimate_messages_tokens,
@@ -1261,28 +1263,40 @@ def _normalize_openai_passthrough_sse_line(
     raw_line: str, *, cap_parallel_tool_calls: bool = False
 ) -> str:
     """Relay comments, [DONE] and unparsable lines as-is; re-serialize only when a compat fix applies."""
+    return _normalize_openai_passthrough_sse_line_and_data(
+        raw_line, cap_parallel_tool_calls = cap_parallel_tool_calls
+    )[0]
+
+
+_SSE_LINE_UNPARSED = object()
+
+
+def _normalize_openai_passthrough_sse_line_and_data(
+    raw_line: str, *, cap_parallel_tool_calls: bool = False
+) -> tuple[str, Any]:
+    """The normalized line plus its decoded JSON when the check had to parse it, so the relay need not."""
     if not raw_line.startswith("data:"):
-        return raw_line
+        return raw_line, _SSE_LINE_UNPARSED
     # Fast path: skip the JSON parse when neither key appears in the line.
     if '"reasoning_content"' not in raw_line and not (
         cap_parallel_tool_calls and '"tool_calls"' in raw_line
     ):
-        return raw_line
+        return raw_line, _SSE_LINE_UNPARSED
     payload = raw_line[len("data:") :].lstrip()
     if payload.strip() in ("", "[DONE]"):
-        return raw_line
+        return raw_line, _SSE_LINE_UNPARSED
     try:
         obj = json.loads(payload)
     except Exception:
-        return raw_line
+        return raw_line, _SSE_LINE_UNPARSED
     if not isinstance(obj, dict):
-        return raw_line
+        return raw_line, obj
     changed = _add_empty_content_to_reasoning_deltas(obj)
     if cap_parallel_tool_calls and _drop_parallel_tool_call_deltas(obj):
         changed = True
     if not changed:
-        return raw_line
-    return "data: " + json.dumps(obj, separators = (",", ":"), ensure_ascii = False)
+        return raw_line, obj
+    return "data: " + json.dumps(obj, separators = (",", ":"), ensure_ascii = False), obj
 
 
 def _prompt_tokens_details(upstream):
@@ -7287,6 +7301,17 @@ def _monitor_openai_sse_line(
     try:
         data = json.loads(data_str)
     except json.JSONDecodeError:
+        return None
+    return _monitor_openai_sse_data(monitor_id, data, context_length)
+
+
+def _monitor_openai_sse_data(
+    monitor_id: Optional[str],
+    data: Any,
+    context_length = None,
+) -> Optional[str]:
+    """Core of ``_monitor_openai_sse_line`` for a data line the caller already decoded."""
+    if not monitor_id:
         return None
     if isinstance(data, dict):
         error_message = _monitor_openai_error_message(data)
@@ -21413,6 +21438,7 @@ async def generate_stream(
                 presence_penalty = request.presence_penalty,
                 cancel_event = cancel_event,
             )
+            gen_step = ThreadStepper(gen).next
             _DONE = object()
             while True:
                 if cancel_event.is_set():
@@ -21421,7 +21447,7 @@ async def generate_stream(
                     # Flag failed so the middleware does not claim the model on a cancelled stream.
                     mark_response_failed(_gs_scope)
                     break
-                chunk = await asyncio.to_thread(next, gen, _DONE)
+                chunk = await gen_step(_DONE)
                 if chunk is _DONE:
                     if cancel_event.is_set():
                         mark_response_failed(_gs_scope)
@@ -30609,6 +30635,7 @@ async def produce_openai_chat_completions(
                         yield _chat_role_chunk(completion_id, created, model_name)
 
                         gen = audio_input_generate()
+                        gen_step = ThreadStepper(gen).next
                         _DONE = object()
                         cancelled = False
                         while True:
@@ -30622,7 +30649,7 @@ async def produce_openai_chat_completions(
                                 api_monitor.finish(monitor_id, "cancelled")
                                 mark_current_response_failed()
                                 return
-                            chunk_text = await asyncio.to_thread(next, gen, _DONE)
+                            chunk_text = await gen_step(_DONE)
                             if chunk_text is _DONE:
                                 if cancel_event.is_set():
                                     cancelled = True
@@ -31478,6 +31505,7 @@ async def produce_openai_chat_completions(
                     context_refusal.open_slot()
                     # In a thread so the event loop stays free for disconnect detection.
                     gen = gguf_generate_with_tools()
+                    gen_step = ThreadStepper(gen).next
                     prev_text = ""
                     _gguf_display_strip = _StreamingDisplayStrip(
                         auto_heal_tool_calls = _gguf_auto_heal_tool_calls,
@@ -31522,9 +31550,7 @@ async def produce_openai_chat_completions(
                             resume_before_next = False
                             await _park_admission(False)
 
-                        next_task = asyncio.create_task(
-                            asyncio.to_thread(next, gen, _tool_sentinel)
-                        )
+                        next_task = asyncio.create_task(gen_step(_tool_sentinel))
                         try:
                             # asyncio.wait never cancels next_task, matching the finally-drain shield.
                             wait_timeout = (
@@ -32200,6 +32226,7 @@ async def produce_openai_chat_completions(
 
                     # In a thread so the event loop stays free for disconnect detection.
                     gen = gguf_generate()
+                    gen_step = ThreadStepper(gen).next
                     prev_text = ""
                     reasoning_extractor = _new_chat_reasoning_extractor()
                     _stream_usage = None
@@ -32214,9 +32241,7 @@ async def produce_openai_chat_completions(
                             mark_current_response_failed()
                             api_monitor.finish(monitor_id, "cancelled")
                             return
-                        next_task = asyncio.create_task(
-                            asyncio.to_thread(next, gen, _gguf_sentinel)
-                        )
+                        next_task = asyncio.create_task(gen_step(_gguf_sentinel))
                         try:
                             # Stall-timeout wait: keepalive while the generator stays
                             # silent (e.g. no-tool prefill). asyncio.wait never cancels
@@ -33346,6 +33371,7 @@ async def produce_openai_chat_completions(
                 yield _chat_role_chunk(completion_id, created, model_name)
 
                 gen = sf_generate_with_tools()
+                gen_step = ThreadStepper(gen).next
                 prev_text = ""
                 _sf_display_strip = _StreamingDisplayStrip(
                     auto_heal_tool_calls = _sf_auto_heal_tool_calls,
@@ -33380,9 +33406,7 @@ async def produce_openai_chat_completions(
                         return
 
                     # Keepalive so silent backend segments do not exceed proxy timeouts.
-                    _sf_next_task = asyncio.create_task(
-                        asyncio.to_thread(next, gen, _sf_tool_sentinel)
-                    )
+                    _sf_next_task = asyncio.create_task(gen_step(_sf_tool_sentinel))
                     wait_timeout = (
                         TOOL_APPROVAL_FLUSH_DELAY_S
                         if approval_flush_pending
@@ -34041,13 +34065,14 @@ async def produce_openai_chat_completions(
                 # Worker thread: a blocking _gen_lock in compare mode would otherwise freeze the loop.
                 _DONE = object()  # sentinel for generator exhaustion
                 gen = generate()
+                gen_step = ThreadStepper(gen).next
                 while True:
                     if cancel_event.is_set():
                         backend.reset_generation_state(cancel_event)
                         mark_current_response_failed()
                         break
                     # next(gen, _DONE) avoids StopIteration, which can't cross asyncio futures.
-                    _next_task = asyncio.create_task(asyncio.to_thread(next, gen, _DONE))
+                    _next_task = asyncio.create_task(gen_step(_DONE))
                     while True:
                         _done_tasks, _ = await asyncio.wait(
                             {_next_task},
@@ -35831,6 +35856,7 @@ async def _openai_catalog_with_aliases(quant_pins: bool = False) -> list[dict]:
 # compatibility alias for the canonical OpenAI path.
 @router.get("/models/", include_in_schema = False)
 @router.get("/models")
+@in_scan_memo
 async def openai_list_models(
     output_modalities: Optional[str] = None, current_subject: str = Depends(get_current_subject)
 ):
@@ -36438,11 +36464,12 @@ async def _mlx_completions(request, current_subject, backend, body: dict, refusa
                     )
                 _DONE = object()
                 gen = generate(prompt_ids) if budget != 0 else iter(())
+                gen_step = ThreadStepper(gen).next
                 prev = ""
                 while True:
                     if cancel_event.is_set():
                         break
-                    next_task = asyncio.create_task(asyncio.to_thread(next, gen, _DONE))
+                    next_task = asyncio.create_task(gen_step(_DONE))
                     while not (
                         await asyncio.wait(
                             {next_task}, timeout = _LOCAL_TOOL_STREAM_STALL_KEEPALIVE_S
@@ -43611,6 +43638,7 @@ async def _anthropic_tool_stream(
             # The respawn refit records the refusal from the worker thread, so open the slot out here first.
             context_refusal.open_slot()
             gen = run_gen()
+            gen_step = ThreadStepper(gen).next
             _next_task = None
             # The in-loop poll fires only between events, so a mid-prefill disconnect needs a watcher.
             disconnect_watcher = asyncio.create_task(
@@ -43624,7 +43652,7 @@ async def _anthropic_tool_stream(
                         mark_response_failed(getattr(request, "scope", None))
                         return
                     # Stall keepalive: silent backend segments must not idle the SSE stream past proxy timeouts.
-                    _next_task = asyncio.create_task(asyncio.to_thread(next, gen, _sentinel))
+                    _next_task = asyncio.create_task(gen_step(_sentinel))
                     while True:
                         _done_tasks, _ = await asyncio.wait(
                             {_next_task},
@@ -43705,6 +43733,7 @@ async def _anthropic_plain_stream(
             captured_finish_reason = None
 
             gen = run_gen()
+            gen_step = ThreadStepper(gen).next
             _next_task = None
             # Watcher cancels on disconnect since the in-loop poll only runs between chunks, not mid-prefill.
             disconnect_watcher = asyncio.create_task(
@@ -43718,7 +43747,7 @@ async def _anthropic_plain_stream(
                         mark_response_failed(getattr(request, "scope", None))
                         return
                     # Stall keepalive each window while next(gen) runs in a worker.
-                    _next_task = asyncio.create_task(asyncio.to_thread(next, gen, _sentinel))
+                    _next_task = asyncio.create_task(gen_step(_sentinel))
                     while True:
                         _done_tasks, _ = await asyncio.wait(
                             {_next_task},
@@ -46078,15 +46107,16 @@ async def _openai_passthrough_stream_admitted(
                         yield raw_line + "\n\n"
                         monitor_done = True
                         break
-                    raw_line = _normalize_openai_passthrough_sse_line(
+                    raw_line, chunk_data = _normalize_openai_passthrough_sse_line_and_data(
                         raw_line,
                         cap_parallel_tool_calls = payload.parallel_tool_calls is False,
                     )
-                    data_text = raw_line[5:].strip()
-                    try:
-                        chunk_data = json.loads(data_text)
-                    except json.JSONDecodeError:
-                        chunk_data = None
+                    if chunk_data is _SSE_LINE_UNPARSED:
+                        data_text = raw_line[5:].strip()
+                        try:
+                            chunk_data = json.loads(data_text)
+                        except json.JSONDecodeError:
+                            chunk_data = None
                     if isinstance(chunk_data, dict):
                         if isinstance(chunk_data.get("id"), str):
                             last_chunk_id = chunk_data["id"]
@@ -46108,7 +46138,10 @@ async def _openai_passthrough_stream_admitted(
                             saw_stream_error = True
                             mark_response_failed(getattr(request, "scope", None))
                     if not client_wants_progress and _is_prefill_progress_only(chunk_data):
-                        _monitor_openai_sse_line(monitor_id, raw_line, llama_backend.context_length)
+                        # chunk_data decodes raw_line (a data: line), so skip the monitor's re-parse.
+                        _monitor_openai_sse_data(
+                            monitor_id, chunk_data, llama_backend.context_length
+                        )
                         if progress_keepalive.due():
                             yield _OPENAI_PREFILL_PROGRESS_SSE
                         continue
@@ -46148,10 +46181,17 @@ async def _openai_passthrough_stream_admitted(
                         yield finish_line + "\n\n"
                         saw_finish_reason = True
                     for out_line in out_lines:
-                        monitor_event = _monitor_openai_sse_line(
-                            monitor_id,
-                            out_line,
-                            llama_backend.context_length,
+                        monitor_event = (
+                            # The healer leaves chunk_data untouched whenever it relays raw_line.
+                            _monitor_openai_sse_data(
+                                monitor_id, chunk_data, llama_backend.context_length
+                            )
+                            if out_line is raw_line and chunk_data is not None
+                            else _monitor_openai_sse_line(
+                                monitor_id,
+                                out_line,
+                                llama_backend.context_length,
+                            )
                         )
                         if monitor_event == "error":
                             saw_stream_error = True
@@ -46952,10 +46992,10 @@ async def diffusion_download_plan(
     await _refuse_disabled_nvfp4_checkpoint(request)
     from core.inference.diffusion import (
         get_diffusion_backend,
-        resolve_local_single_file,
         split_local_checkpoint_path,
         resolve_model_kind,
     )
+    from core.inference.diffusion_local_files import resolve_local_single_file
     from core.inference.diffusion_engine_router import predict_engine
     from core.inference.diffusion_hub_evidence import prefetch_for_pick
     from core.inference.sd_cpp_engine import ENGINE_MLX, ENGINE_SD_CPP
@@ -47192,10 +47232,10 @@ async def load_diffusion_model_gated(
     ]
     from core.inference.diffusion import (
         get_diffusion_backend,
-        resolve_local_single_file,
         split_local_checkpoint_path,
         resolve_model_kind,
     )
+    from core.inference.diffusion_local_files import resolve_local_single_file
     from core.inference.diffusion_device import (
         resolve_diffusion_device_target,
         resolve_selected_cuda_ordinal,
