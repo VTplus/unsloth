@@ -9,7 +9,7 @@ denoiser is stored as int8 per-channel weights. ``UNSLOTH_DIFFUSION_SMALL_HOST=0
 Windows commit budget at the physical RAM available for image and video diffusion loads (pipeline, GGUF and single-file
 converter loads); llama/chat loads are unaffected. This estimate-based routing policy does not lock pages or prevent
 paging. LoRA loads keep their dense route because the low-memory route cannot carry adapters, even when the capped
-budget is exceeded.
+budget is exceeded; ``UNSLOTH_DIFFUSION_SMALL_HOST=1`` forces the route and overrides this exception.
 """
 
 from __future__ import annotations
