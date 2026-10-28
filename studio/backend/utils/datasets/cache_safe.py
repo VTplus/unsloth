@@ -1,19 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Permission-safe wrapper around datasets.load_dataset.
-
-A shared HF datasets cache can contain subtrees owned by another user (for
-example populated by an earlier root-run job). datasets then raises
-"[Errno 13] Permission denied: ..._builder.lock" while locking the cached
-builder, killing the training run even though the dataset itself is fine.
-Retry such loads in an Unsloth-owned cache so the run proceeds; the worst case
-is one rebuild of the dataset in the fallback location.
-
-On Windows, huggingface_hub's concurrent symlink capability probe can also
-publish a brief false positive and raise WinError 1314; only then, retry in
-its regular-file cache mode for this worker.
-"""
+"""Retries load_dataset in an Unsloth-owned cache on Errno 13 from a shared HF cache; on Windows,
+only WinError 1314 retries in regular-file cache mode for this worker"""
 
 import logging
 import os
@@ -56,8 +45,7 @@ class _NoSymlinkSupport(dict):
 def _disable_hf_symlinks_for_process() -> None:
     """Switch an affected worker to HF's regular-file cache fallback."""
     os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
-    # huggingface_hub is already imported, so update its live state too. Hub 1.9
-    # added this constant; older installs decide purely from the mapping below.
+    # huggingface_hub is already imported, so its live state must be updated too; Hub 1.9 added the constant.
     try:
         from huggingface_hub import constants, file_download
     except ImportError:  # never mask the load error we are recovering
@@ -101,8 +89,7 @@ def load_dataset_cache_safe(*args, **kwargs):
             try:
                 return load_dataset(*args, **kwargs)
             except OSError as retry_error:
-                # A second 1314 is a cache dir Hub had not probed; the
-                # Unsloth-owned cache is probed fresh and clears both cases.
+                # A second 1314 is a cache dir Hub had not probed; the Unsloth-owned cache is probed fresh too.
                 if _is_retryable_cache_error(retry_error):
                     return _retry_in_studio_cache(load_dataset, args, kwargs, retry_error)
                 raise
@@ -119,8 +106,7 @@ def _retry_in_studio_cache(load_dataset, args, kwargs, error):
         fallback,
     )
     kwargs["cache_dir"] = fallback
-    # Nested builders consult the env var while the load runs; restore it
-    # after so other datasets keep trying the shared cache first.
+    # Nested builders read the env var during the load; restore it after so other datasets still try the shared cache first.
     old_env = os.environ.get("HF_DATASETS_CACHE")
     os.environ["HF_DATASETS_CACHE"] = fallback
     try:

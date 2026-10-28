@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Map a chunk to highlight rectangles on its page (computed at ingest).
-
-The chunk's leading phrase is anchored in the page word list (``get_text("words")``),
-so matching survives ligatures and dehyphenation that glyph-exact ``search_for``
-misses. Matched words union per line into rects normalized to 0..1. Missing
-PyMuPDF, a too-short anchor, or no unique match yields no regions (never a guess).
-"""
+"""Highlight rects for a chunk, anchored on its leading phrase in PyMuPDF word list (survives
+ligatures); missing PyMuPDF, short anchor or no unique match yields no regions, never a guess."""
 
 from __future__ import annotations
 
@@ -37,10 +32,7 @@ def _norm_token(token: str) -> str:
 
 
 def _anchor_tokens(page_text: str, match: LocatorMatch) -> list[str]:
-    """Normalized anchor tokens from the chunk's leading span. Drops first and last
-    token (boundaries often slice mid-word) when long enough. Pipes are split out so
-    Markdown table cells (``|Q1|$1.2M|``) become individual words that match the PDF
-    word stream."""
+    """Drops the first and last word of the span (often cut mid-word); pipes split table cells apart."""
     segment = page_text[match.start : match.end]
     raw = segment.replace("|", " ").split()
     if len(raw) >= MIN_ANCHOR_WORDS + 2:
@@ -63,10 +55,7 @@ def _find_subsequences(haystack: list[str], needle: list[str]) -> list[int]:
 
 
 def _locate(page_words: list, needle: list[str]) -> list[int] | None:
-    """Matched word indices for the best anchor, or None. Tries the full anchor
-    then shorter prefixes, taking the first that matches exactly once; else the
-    first hit if still ambiguous."""
-    # Skip punctuation-only words so they never break a phrase.
+    """Skip punctuation-only words so they never break a phrase."""
     tokens: list[str] = []
     idx_map: list[int] = []
     for j, w in enumerate(page_words):
