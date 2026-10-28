@@ -1,21 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Compile a dense denoiser in the background while the user's renders keep running eager.
-
-``arm`` records the first few distinct denoiser inputs of a render run under ``force_eager`` (read by every compile
-guard and CUDA-graph wrapper); ``kick`` replays them through the compiled callable on a daemon thread with CUDA-graph
-capture suppressed, so the next render pays only the capture. A render arriving mid-compile waits for it: a render
-beside the compile was starved to 49-62 s on a B200. Any failure ends the attempt and the next render compiles inline.
-
-Dense denoisers only: torchao ones are ~30x slower eager. Offloaded ones too: no render runs beside the compile,
-so offload hooks see one forward at a time (UNSLOTH_DIFFUSION_BG_COMPILE_OFFLOADED=0 opts out). By default only the deferred
-profile (generation 3, already eager -> compiled) uses it; UNSLOTH_DIFFUSION_BG_COMPILE=1 also moves a load's
-first-render compile (render 1 then differs from render 2 for one seed), =0 disables it.
-
-``dynamic=True`` SymFloats dynamo cannot tensorify (norm ``eps``) cost a restart per block type; their names are
-saved in the load's compile-cache dir and pre-seeded next load (UNSLOTH_DIFFUSION_BG_COMPILE_FLOAT_SEEDS=0 opts out).
-"""
+"""Dense denoisers (offloaded too) compile in background while renders run eager; a render mid-
+compile waits for it; any failure ends the attempt and the next render compiles inline;
+UNSLOTH_DIFFUSION_BG_COMPILE=0 disables"""
 
 from __future__ import annotations
 
@@ -114,6 +102,14 @@ def _code_signature(module: Any) -> Optional[str]:
         return None
 
 
+def _modules_signature(modules: Any) -> Optional[str]:
+    modules = list(modules) if isinstance(modules, (list, tuple)) else [modules]
+    sigs = [_code_signature(m) for m in modules]
+    if not sigs or any(s is None for s in sigs):
+        return None
+    return sigs[0] if len(sigs) == 1 else hashlib.sha256("|".join(sigs).encode("utf-8")).hexdigest()
+
+
 def _read_float_seeds(path: Path, signature: str) -> set:
     try:
         data = json.loads(path.read_text(encoding = "utf-8"))
@@ -146,6 +142,91 @@ def _write_float_seeds(path: Path, signature: str, names: set) -> bool:
         with contextlib.suppress(Exception):
             tmp.unlink()
         return False
+
+
+def _seed_floats(modules: Any, seed_dir: Optional[Path]) -> tuple[Optional[tuple], int]:
+    """Pre-seed the SymFloat names the last compile of this key learned; returns (keep state, names added)."""
+    if seed_dir is None or not float_seeds_enabled():
+        return None, 0
+    try:
+        state = _tensorify_state()
+        signature = _modules_signature(modules)
+        if state is None or signature is None:
+            return None, 0
+        path = Path(seed_dir) / FLOAT_SEEDS_FILE
+        before = set(state.force_specializations)
+        seeds = _read_float_seeds(path, signature)
+        for name in sorted(seeds - before):
+            state.specialize(name)
+        return (state, path, signature, before, seeds), len(seeds - before)
+    except Exception:  # noqa: BLE001 - no seeds: the compile restarts as before
+        return None, 0
+
+
+def _keep_floats(seeded: Optional[tuple]) -> int:
+    """Save this compile's specialised names if changed; returns how many are new."""
+    if seeded is None:
+        return 0
+    state, path, signature, before, seeds = seeded
+    try:
+        names = {
+            n for n in set(state.force_specializations) - before if _SYMFLOAT_NAME.match(str(n))
+        }
+        names |= seeds & set(state.force_specializations)
+        if names and names != seeds:
+            _write_float_seeds(path, signature, names)
+        return len(names - seeds)
+    except Exception:  # noqa: BLE001 - bookkeeping only
+        return 0
+
+
+class InlineFloatSeeds:
+    """Float seeds for a compile inside a render (video's first clip): ``seed`` at denoise entry, ``keep`` at decode
+    entry, so only the denoiser's names are saved. Never raises."""
+
+    def __init__(
+        self,
+        modules: Any,
+        seed_dir: Any,
+        *,
+        logger: Any = None,
+    ) -> None:
+        self.modules = list(modules) if isinstance(modules, (list, tuple)) else [modules]
+        self.seed_dir = Path(seed_dir) if seed_dir else None
+        self.logger = logger
+        self.float_seeds = 0
+        self.float_seeds_learned = 0
+        self.seeded = False
+        self.kept = False
+        self._seeds: Optional[tuple] = None
+
+    def seed(self) -> int:
+        if self.seeded:
+            return 0
+        self.seeded = True
+        self._seeds, self.float_seeds = _seed_floats(self.modules, self.seed_dir)
+        if self.float_seeds and self.logger is not None:
+            with contextlib.suppress(Exception):
+                self.logger.info(
+                    "diffusion.float_seeds: %d float specialisation(s) pre-seeded for the %s compile",
+                    self.float_seeds,
+                    "/".join(type(m).__name__ for m in self.modules),
+                )
+        return self.float_seeds
+
+    def keep(self) -> None:
+        if not self.seeded or self.kept:
+            return
+        self.kept = True
+        self.float_seeds_learned = _keep_floats(self._seeds)
+        self._seeds = None
+        self.modules = []
+
+    def done(self) -> bool:
+        return self.kept
+
+    def describe(self) -> dict:
+        return {"float_seeds": self.float_seeds, "float_seeds_learned": self.float_seeds_learned}
 
 
 def load_time_enabled() -> bool:
@@ -621,37 +702,11 @@ class BackgroundCompile:
 
     def _seed_floats(self) -> Optional[tuple]:
         """Pre-seed the SymFloat specialisations this key's last compile learned; returns what ``_keep_floats`` needs."""
-        if self.seed_dir is None or not float_seeds_enabled():
-            return None
-        try:
-            state = _tensorify_state()
-            signature = _code_signature(self.module)
-            if state is None or signature is None:
-                return None
-            path = self.seed_dir / FLOAT_SEEDS_FILE
-            before = set(state.force_specializations)
-            seeds = _read_float_seeds(path, signature)
-            for name in sorted(seeds - before):
-                state.specialize(name)
-            self.float_seeds = len(seeds - before)
-            return (state, path, signature, before, seeds)
-        except Exception:  # noqa: BLE001 - no seeds: the compile restarts as before
-            return None
+        seeded, self.float_seeds = _seed_floats(self.module, self.seed_dir)
+        return seeded
 
     def _keep_floats(self, seeded: Optional[tuple]) -> None:
-        if seeded is None:
-            return
-        state, path, signature, before, seeds = seeded
-        try:
-            names = {
-                n for n in set(state.force_specializations) - before if _SYMFLOAT_NAME.match(str(n))
-            }
-            names |= seeds & set(state.force_specializations)
-            self.float_seeds_learned = len(names - seeds)
-            if names and names != seeds:
-                _write_float_seeds(path, signature, names)
-        except Exception:  # noqa: BLE001 - bookkeeping only
-            pass
+        self.float_seeds_learned = _keep_floats(seeded)
 
     def close(self, timeout: Optional[float] = None) -> None:
         """Stop recording and wait for an in-flight compile (it holds the module); used on unload."""
