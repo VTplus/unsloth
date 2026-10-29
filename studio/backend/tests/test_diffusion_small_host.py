@@ -274,8 +274,7 @@ def test_the_pipeline_decision_passes_the_commit_headroom_and_logs_a_dense_decis
     d = decide(None)
     assert not d.engaged and d.refuse is None
     assert (
-        records[-1]
-        == f"diffusion.small_host: engaged=False ({d.reason}); snapshot={tmp_path.name}"
+        records[-1] == f"diffusion.small_host: engaged=False ({d.reason}); snapshot={tmp_path.name}"
     )
     d = decide(30 * 1024)
     assert d.engaged and d.refuse is None and d.commit_mib == 30 * 1024
@@ -286,9 +285,7 @@ def test_the_pipeline_decision_passes_the_commit_headroom_and_logs_a_dense_decis
     )
 
 
-def test_the_pipeline_decision_logs_a_non_applicable_load_with_the_snapshot(
-    tmp_path, monkeypatch
-):
+def test_the_pipeline_decision_logs_a_non_applicable_load_with_the_snapshot(tmp_path, monkeypatch):
     from core.inference import diffusion as dif
 
     records = []
