@@ -6,8 +6,9 @@
 not fit: big components load at their stored bf16 (memory-mapped), encoders stream with layerwise casting, a streamed
 denoiser is stored as int8 per-channel weights. ``UNSLOTH_DIFFUSION_SMALL_HOST=0|1`` disables / forces it;
 ``UNSLOTH_DIFFUSION_HOST_RAM_CHECK=0`` skips the pre-load refusal. ``UNSLOTH_DIFFUSION_HOST_RAM_NO_SWAP=1`` caps the
-Windows commit budget at the physical RAM available for image and video diffusion loads (pipeline, GGUF and single-file
-converter loads); llama/chat loads are unaffected. This estimate-based routing policy does not lock pages or prevent
+Windows commit budget at the physical RAM available for image pipeline/GGUF loads and guarded image/video single-file
+converter loads. Other video pipeline loaders and llama/chat loads are outside these guard paths.
+This estimate-based routing policy does not lock pages or prevent
 paging. LoRA loads keep their dense route because the low-memory route cannot carry adapters, even when the capped
 budget is exceeded; ``UNSLOTH_DIFFUSION_SMALL_HOST=1`` forces the route and overrides this exception.
 """
@@ -27,7 +28,7 @@ SMALL_HOST_ENV = "UNSLOTH_DIFFUSION_SMALL_HOST"
 HOST_RAM_CHECK_ENV = "UNSLOTH_DIFFUSION_HOST_RAM_CHECK"
 # test hook: caps every host reading the guards take (total, available, commit)
 HOST_RAM_LIMIT_ENV = "UNSLOTH_DIFFUSION_HOST_RAM_LIMIT_MIB"
-# Opt-in budget cap for image/video diffusion; llama/chat loads use a separate loader.
+# Opt-in budget cap for guarded diffusion loaders; llama/chat loads use a separate loader.
 NO_SWAP_ENV = "UNSLOTH_DIFFUSION_HOST_RAM_NO_SWAP"
 SMALL_HOST_ATTR = "_unsloth_small_host"
 
@@ -465,17 +466,18 @@ def decide_small_host(
         commit_note = ""
     elif no_swap_bound:
         commit_note = (
-            f", {commit} MiB no-swap budget, image+video diffusion (llama models excluded),"
-            f" source ~{source_mib} MiB (dense needs ~{dense_commit} MiB)"
+            f", {commit} MiB no-swap budget, image+video diffusion"
+            " (image pipeline/GGUF guard; llama models excluded),"
+            f" commit-charged source ~{source_mib} MiB (dense needs ~{dense_commit} MiB)"
         )
     elif no_swap:
         commit_note = (
             f", {commit} MiB commit headroom (no-swap, cap not binding),"
-            f" source ~{source_mib} MiB (dense needs ~{dense_commit} MiB)"
+            f" commit-charged source ~{source_mib} MiB (dense needs ~{dense_commit} MiB)"
         )
     else:
         commit_note = (
-            f", {commit} MiB commit headroom, source ~{source_mib} MiB"
+            f", {commit} MiB commit headroom, commit-charged source ~{source_mib} MiB"
             f" (dense needs ~{dense_commit} MiB)"
         )
     extra = {"commit_mib": commit, "dense_commit_mib": dense_commit, "no_swap": no_swap}

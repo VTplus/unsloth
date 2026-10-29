@@ -437,8 +437,10 @@ class HostRamBudget:
 
     With ``UNSLOTH_DIFFUSION_HOST_RAM_NO_SWAP=1`` the Windows commit headroom caps this budget at
     ``min(available, commit)`` for image and video diffusion single-file loads - the same contract the
-    pipeline and GGUF decision applies in ``decide_small_host``; Linux / macOS read no commit headroom
-    and stay unchanged."""
+    image-pipeline and GGUF decision applies in ``decide_small_host``; Linux / macOS read no commit headroom
+    and stay unchanged. This is not a guard for other video pipeline loaders.
+    Without a readable available-RAM measurement this budget stays inactive, even if commit headroom
+    could be read; no commit reading is taken in that case."""
 
     def __init__(
         self,
@@ -483,9 +485,10 @@ class HostRamBudget:
         # No-swap policy (same contract as decide_small_host): cap the budget at the Windows commit
         # headroom, read once per load. Linux / macOS read None and keep the physical budget.
         if no_swap_enabled():
+            # An unreadable commit reading leaves the physical budget unchanged.
             try:
                 commit = host_commit_mib()
-            except Exception:  # noqa: BLE001 -- unreadable commit reading means no cap, like a None reading on both paths
+            except Exception:  # noqa: BLE001
                 commit = None
             if commit is not None:
                 self.commit_mib = int(commit)

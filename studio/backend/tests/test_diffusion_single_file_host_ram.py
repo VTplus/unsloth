@@ -319,6 +319,58 @@ def test_no_swap_caps_the_live_charges_too(monkeypatch):
         budget.charge(4 * conv._MIB)
 
 
+def test_no_swap_unreadable_physical_ram_keeps_the_converter_budget_inactive(monkeypatch):
+    _host(monkeypatch, available_mib = None)
+    monkeypatch.setenv(small_host.NO_SWAP_ENV, "1")
+    reads = []
+
+    def commit():
+        reads.append(True)
+        return 1
+
+    monkeypatch.setattr(small_host, "host_commit_mib", commit)
+    budget = conv.HostRamBudget("unreadable.safetensors", "widening its weights")
+    budget.check(64 * 1024 * conv._MIB)
+    budget.charge(64 * 1024 * conv._MIB)
+    assert budget.available_mib is None and budget.commit_mib is None
+    assert reads == []
+
+
+def test_no_swap_converter_reads_commit_once_across_estimate_and_live_charges(monkeypatch):
+    _host(monkeypatch, available_mib = 32 * 1024, total_mib = 64 * 1024)
+    monkeypatch.setenv(small_host.NO_SWAP_ENV, "1")
+    reads = []
+
+    def commit():
+        reads.append(True)
+        return 16 * 1024 if len(reads) == 1 else 1
+
+    monkeypatch.setattr(small_host, "host_commit_mib", commit)
+    budget = conv.HostRamBudget("widen.safetensors", "widening its weights")
+    budget.check(2 * 1024 * conv._MIB)
+    with budget:
+        conv.charge_host_ram(2 * 1024 * conv._MIB)
+        conv.charge_host_ram(2 * 1024 * conv._MIB)
+    assert budget.commit_mib == 16 * 1024 and len(reads) == 1
+
+
+def test_no_swap_converter_check_switch_disables_both_budget_readings(tmp_path, monkeypatch, krea2):
+    path, _ = _write(tmp_path, "fp8")
+    monkeypatch.setenv(small_host.NO_SWAP_ENV, "1")
+    monkeypatch.setenv(small_host.HOST_RAM_CHECK_ENV, "0")
+    reads = []
+
+    def reading():
+        reads.append(True)
+        return 0
+
+    monkeypatch.setattr(small_host, "host_ram_mib", lambda: (64 * 1024, reading()))
+    monkeypatch.setattr(small_host, "host_commit_mib", reading)
+    model = conv.load_original_layout_transformer(krea2, str(path), dict(_KWARGS))
+    assert model.transformer_blocks[0].attn.to_q.weight.dtype == torch.bfloat16
+    assert reads == []
+
+
 def test_no_swap_cap_does_not_bind_above_the_physical_budget(tmp_path, monkeypatch, krea2):
     """With the option on but the commit headroom above the physical budget, the physical budget keeps
     binding and the refusal carries no no-swap note (same contract as the decision path)."""

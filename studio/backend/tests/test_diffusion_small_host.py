@@ -131,7 +131,7 @@ def test_windows_commit_headroom_routes_a_dense_load_that_fits_physical_ram():
     assert not d.engaged and "commit headroom" in d.reason
     # the default path (NO_SWAP off) carries the same source/dense wording as the no-swap branches;
     # the 242 MiB vae stays below _STREAM_MIN_MIB, so source counts the 16717 MiB encoder only
-    assert "source ~16717 MiB (dense needs ~38448 MiB)" in d.reason
+    assert "commit-charged source ~16717 MiB (dense needs ~38448 MiB)" in d.reason
 
 
 def test_pread_read_components_need_no_source_view_commit():
@@ -484,9 +484,9 @@ def test_lora_refused_and_status_reports_the_int8_route():
     assert not _small_host_int8(object())
 
 
-def test_no_swap_routes_an_image_video_diffusion_load_above_the_physical_budget(monkeypatch):
+def test_no_swap_routes_an_image_pipeline_load_above_the_physical_budget(monkeypatch):
     # The dense commit estimate fits the Windows headroom but exceeds the physical budget. No-swap routes
-    # image/video diffusion; llama/chat loads use a separate loader. No actual paging is measured here.
+    # the image pipeline; llama/chat loads use a separate loader. No actual paging is measured here.
     args = dict(total = 64 * 1024, available = 58 * 1024, host_commit_mib = 85 * 1024)
     plain = _decide(FLUX1, **args)
     assert not plain.engaged and not plain.no_swap and "commit headroom" in plain.reason
@@ -540,7 +540,7 @@ def test_no_swap_leaves_the_no_commit_reading_path_untouched(monkeypatch):
     )
 
 
-def test_no_swap_keeps_the_dense_image_video_lora_exception(monkeypatch):
+def test_no_swap_keeps_the_dense_image_pipeline_lora_exception(monkeypatch):
     monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
     d = _decide(
         FLUX1,
@@ -570,8 +570,8 @@ def test_no_swap_pread_components_keep_the_cap_on_the_converted_copy(monkeypatch
     assert read.commit_mib == 30 * 1024 and "no-swap budget" in read.reason
     assert read.dense_commit_mib == read.dense_host_mib
     # the pread-read encoder holds no source view, so the source figure excludes it
-    assert "source ~16717 MiB" in mapped.reason
-    assert "source ~0 MiB" in read.reason
+    assert "commit-charged source ~16717 MiB" in mapped.reason
+    assert "commit-charged source ~0 MiB" in read.reason
 
 
 @pytest.mark.parametrize("commit", [0, 20 * 1024])
@@ -599,7 +599,7 @@ def test_no_swap_zero_keeps_the_default_decision(monkeypatch):
 
 
 @pytest.mark.parametrize("commit", [50 * 1024, None])
-def test_no_swap_image_video_pipeline_reads_each_budget_once_under_the_test_cap(
+def test_no_swap_image_pipeline_reads_each_budget_once_under_the_test_cap(
     tmp_path, monkeypatch, commit
 ):
     from core.inference import diffusion as dif
@@ -641,10 +641,10 @@ def test_no_swap_image_video_pipeline_reads_each_budget_once_under_the_test_cap(
         # The test hook caps the commit reading to the same limit as the physical budget, so the
         # no-swap cap never binds here and the reason keeps the plain headroom wording.
         assert "24000 MiB commit headroom" in records[0]
-        assert "source ~16717 MiB" in records[0]
+        assert "commit-charged source ~16717 MiB" in records[0]
 
 
-def test_no_swap_image_video_pipeline_logs_the_bound_cap_when_the_test_limit_does_not_bind(
+def test_no_swap_image_pipeline_logs_the_bound_cap_when_the_test_limit_does_not_bind(
     tmp_path, monkeypatch
 ):
     from core.inference import diffusion as dif
@@ -681,5 +681,58 @@ def test_no_swap_image_video_pipeline_logs_the_bound_cap_when_the_test_limit_doe
     assert calls == dict(total = 1, available = 1, commit = 1)
     assert d.total_mib == WIN_TOTAL and d.available_mib == 30 * 1024
     assert d.no_swap and d.engaged and d.commit_mib == 30 * 1024
-    assert "30720 MiB no-swap budget, image+video diffusion (llama models excluded)" in records[0]
-    assert "source ~16717 MiB" in records[0]
+    assert (
+        "30720 MiB no-swap budget, image+video diffusion"
+        " (image pipeline/GGUF guard; llama models excluded)" in records[0]
+    )
+    assert "commit-charged source ~16717 MiB" in records[0]
+
+
+@pytest.mark.parametrize("pread", [False, True])
+def test_no_swap_image_pipeline_uses_the_pread_component_library(tmp_path, monkeypatch, pread):
+    from core.inference import diffusion as dif
+
+    components = {
+        "text_encoder": sh.StoredComponent("text_encoder", 16717, "bfloat16", 0, "transformers"),
+        "vae": QWEN_GGUF_COMPANIONS["vae"],
+    }
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    monkeypatch.setattr(dm, "_host_ram_capacity_mib", lambda: WIN_TOTAL)
+    monkeypatch.setattr(dm, "_available_system_memory_mib", lambda: 30 * 1024)
+    monkeypatch.setattr(dm, "_windows_commit_headroom_mib", lambda: 50 * 1024)
+    monkeypatch.setattr(dif, "stored_components", lambda snapshot: dict(components))
+    monkeypatch.setattr(dif, "pread_available", lambda: pread)
+    monkeypatch.setattr(dif, "spill_capacity_mib", lambda: None)
+    decision = dif.DiffusionBackend()._small_host_decision(
+        str(tmp_path), {}, types.SimpleNamespace(device = "cuda"), torch.float16, lora_active = False
+    )
+    assert decision.no_swap and decision.commit_mib == 30 * 1024
+    assert decision.engaged == (not pread) and decision.refuse is None
+    if pread:
+        assert decision.dense_commit_mib == decision.dense_host_mib
+        assert "commit-charged source ~0 MiB" in decision.reason
+    else:
+        assert decision.dense_commit_mib > decision.dense_host_mib
+        assert "commit-charged source ~16717 MiB" in decision.reason
+
+
+def test_no_swap_image_pipeline_check_switch_disables_refusal_but_keeps_routing(
+    tmp_path, monkeypatch
+):
+    from core.inference import diffusion as dif
+
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    monkeypatch.setattr(dm, "_host_ram_capacity_mib", lambda: 64 * 1024)
+    monkeypatch.setattr(dm, "_available_system_memory_mib", lambda: 3000)
+    monkeypatch.setattr(dm, "_windows_commit_headroom_mib", lambda: 85 * 1024)
+    monkeypatch.setattr(dif, "stored_components", lambda snapshot: dict(FLUX1))
+    monkeypatch.setattr(dif, "pread_available", lambda: False)
+    monkeypatch.setattr(dif, "spill_capacity_mib", lambda: None)
+    backend = dif.DiffusionBackend()
+    args = (str(tmp_path), {}, types.SimpleNamespace(device = "cuda"), torch.float16)
+    with pytest.raises(RuntimeError, match = "Not enough system RAM"):
+        backend._small_host_decision(*args, lora_active = False)
+    monkeypatch.setenv(sh.HOST_RAM_CHECK_ENV, "0")
+    decision = backend._small_host_decision(*args, lora_active = False)
+    assert decision.engaged and decision.no_swap and decision.commit_mib == 3000
+    assert decision.refuse is None and decision.storage_dtypes
