@@ -3339,6 +3339,15 @@ def _peak_model_identity(
     return identity
 
 
+def _snapshot_log_name(snapshot: Any) -> str:
+    """Readable snapshot label for the decision log: the hub cache repo folder, else the directory name."""
+    path = Path(str(snapshot))
+    for part in reversed(path.parts):
+        if part.startswith("models--"):
+            return part
+    return path.name
+
+
 def _small_host_fetch(
     pipeline_cls: Any,
     repo: Any,
@@ -12049,15 +12058,27 @@ class DiffusionBackend:
             pread_libraries = ("transformers",) if pread_available() else (),
             spill_free_mib = spill_capacity_mib(),
         )
+        snapshot_name = _snapshot_log_name(snapshot)
         if decision.engaged or decision.refuse:
             logger.info(
-                "diffusion.small_host: engaged=%s (%s); stored-dtype components=%s",
+                "diffusion.small_host: engaged=%s (%s); stored-dtype components=%s; snapshot=%s",
                 decision.engaged,
                 decision.reason,
                 decision.storage_dtypes,
+                snapshot_name,
             )
         elif decision.available_mib is not None:
-            logger.info("diffusion.small_host: engaged=False (%s)", decision.reason)
+            logger.info(
+                "diffusion.small_host: engaged=False (%s); snapshot=%s",
+                decision.reason,
+                snapshot_name,
+            )
+        else:
+            logger.info(
+                "diffusion.small_host: not applicable (%s); snapshot=%s",
+                decision.reason,
+                snapshot_name,
+            )
         if decision.int8_spill:
             logger.info(
                 "diffusion.small_host: int8 denoiser spills to a memory-mapped scratch file (host estimate %d MiB "

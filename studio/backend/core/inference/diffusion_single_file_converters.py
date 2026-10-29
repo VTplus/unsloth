@@ -451,6 +451,7 @@ class HostRamBudget:
         fp8_widen_chosen: bool = False,
     ) -> None:
         from .diffusion_small_host import (
+            HOST_RAM_CHECK_ENV,
             host_commit_mib,
             host_ram_check_disabled,
             host_ram_mib,
@@ -469,12 +470,14 @@ class HostRamBudget:
             0  # only to arm a load that started under the floor; the check reads live memory
         )
         if host_ram_check_disabled():
+            self._log_budget(f"disabled ({HOST_RAM_CHECK_ENV}=0)")
             return
         try:
             total, available = host_ram_mib()
         except Exception:  # noqa: BLE001 -- unreadable: no claim, as the small-host route does
-            return
+            available = None
         if available is None:
+            self._log_budget("inactive (host RAM unreadable)")
             return
         self.available_mib = int(available)
         # Capped only for a load the fp8-storage rule chose to widen, so the two never disagree; any other load
@@ -484,7 +487,8 @@ class HostRamBudget:
         )
         # No-swap policy (same contract as decide_small_host): cap the budget at the Windows commit
         # headroom, read once per load. Linux / macOS read None and keep the physical budget.
-        if no_swap_enabled():
+        no_swap = no_swap_enabled()
+        if no_swap:
             # An unreadable commit reading leaves the physical budget unchanged.
             try:
                 commit = host_commit_mib()
@@ -499,6 +503,25 @@ class HostRamBudget:
         except OSError:
             size_mib = HOST_RAM_CHECK_MIN_MIB
         self.armed = size_mib >= HOST_RAM_CHECK_MIN_MIB
+        budget_mib = (
+            self.available_mib
+            if self.commit_mib is None
+            else min(self.available_mib, self.commit_mib)
+        )
+        commit_note = "none" if self.commit_mib is None else f"{self.commit_mib} MiB"
+        self._log_budget(
+            f"{budget_mib} MiB (available {self.available_mib} MiB, commit {commit_note}, "
+            f"no-swap {'on' if no_swap else 'off'}), reserve {self.reserve_mib} MiB, armed={self.armed}"
+        )
+
+    def _log_budget(self, state: str) -> None:
+        """One INFO line per load: the numbers a later log audit needs to justify the budget."""
+        if self.logger is not None:
+            self.logger.info(
+                "diffusion.single_file: host RAM budget %s: %s",
+                os.path.basename(str(self.path)),
+                state,
+            )
 
     def _refuse_if_over(self, need_bytes: int, available_mib: int, at_least: bool) -> None:
         from .diffusion_small_host import HOST_RAM_CHECK_ENV

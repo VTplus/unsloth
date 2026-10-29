@@ -488,11 +488,14 @@ def decide_small_host(
             f", {commit} MiB commit headroom, commit-charged source ~{source_mib} MiB"
             f" (dense needs ~{dense_commit} MiB)"
         )
+    # A later log audit re-derives the reserve from the host size; the decision line carries it.
+    total_note = f", host total ~{host_total_mib} MiB" if host_total_mib is not None else ""
     extra = {"commit_mib": commit, "dense_commit_mib": dense_commit, "no_swap": no_swap}
     if fits and not forced:
         return SmallHostDecision(
             False,
-            f"dense {compute} load ({dense} MiB) fits {host_available_mib} MiB available host RAM{commit_note}",
+            f"dense {compute} load ({dense} MiB) fits {host_available_mib} MiB available host RAM"
+            f"{commit_note}{total_note}",
             host_available_mib,
             host_total_mib,
             dense,
@@ -504,7 +507,7 @@ def decide_small_host(
         return SmallHostDecision(
             False,
             f"LoRA adapters need the dense denoiser (dense load ~{dense} MiB, {host_available_mib} MiB available"
-            f"{commit_note})",
+            f"{commit_note}{total_note})",
             host_available_mib,
             host_total_mib,
             dense,
@@ -515,18 +518,19 @@ def decide_small_host(
         converted, compute, route, reserve, host_available_mib, spill_free_mib
     )
     need = spill_route if spill else route
+    over = host_available_mib is not None and need + reserve > int(host_available_mib)
+    check_off = over and host_ram_check_disabled()
     refuse = None
-    if (
-        host_available_mib is not None
-        and need + reserve > int(host_available_mib)
-        and not host_ram_check_disabled()
-    ):
+    if over and not check_off:
         refuse = _refusal(need, reserve, host_available_mib, "even the low-memory route")
+    # ``route`` is the budget the decision actually relies on; a suppressed refusal names its switch.
+    route_note = f", low-memory route ~{need} MiB"
+    check_note = f", refusal suppressed by {HOST_RAM_CHECK_ENV}=0" if check_off else ""
     why = (
-        f"{SMALL_HOST_ENV}=1"
+        f"{SMALL_HOST_ENV}=1{total_note}{route_note}{check_note}"
         if forced and fits
         else f"dense {compute} load needs ~{dense} MiB + {reserve} MiB reserve of host RAM, "
-        f"{host_available_mib} MiB available{commit_note}"
+        f"{host_available_mib} MiB available{commit_note}{total_note}{route_note}{check_note}"
     )
     return SmallHostDecision(
         True,

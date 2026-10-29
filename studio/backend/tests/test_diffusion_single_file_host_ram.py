@@ -336,6 +336,58 @@ def test_no_swap_unreadable_physical_ram_keeps_the_converter_budget_inactive(mon
     assert reads == []
 
 
+def test_the_budget_logs_its_numbers_once_per_load(monkeypatch):
+    _host(monkeypatch, available_mib = 32 * 1024, total_mib = 64 * 1024)
+    _no_swap(monkeypatch, 16 * 1024)
+    records = []
+
+    class _LogSpy:
+        def info(self, event, *args):
+            records.append(event % args if args else event)
+
+    budget = conv.HostRamBudget("widen.safetensors", "widening its weights", _LogSpy())
+    assert budget.available_mib == 32 * 1024 and budget.commit_mib == 16 * 1024
+    assert records == [
+        f"diffusion.single_file: host RAM budget widen.safetensors: 16384 MiB "
+        f"(available 32768 MiB, commit 16384 MiB, no-swap on), "
+        f"reserve {budget.reserve_mib} MiB, armed=True"
+    ]
+
+
+def test_the_budget_logs_a_disabled_check_without_reading_ram(monkeypatch):
+    monkeypatch.setenv(small_host.HOST_RAM_CHECK_ENV, "0")
+    reads = []
+    monkeypatch.setattr(small_host, "host_ram_mib", lambda: reads.append(True) or (0, 0))
+    monkeypatch.setattr(small_host, "host_commit_mib", lambda: reads.append(True) or 0)
+    records = []
+
+    class _LogSpy:
+        def info(self, event, *args):
+            records.append(event % args if args else event)
+
+    budget = conv.HostRamBudget("widen.safetensors", "widening its weights", _LogSpy())
+    assert budget.available_mib is None and reads == []
+    assert records == [
+        "diffusion.single_file: host RAM budget widen.safetensors: "
+        f"disabled ({small_host.HOST_RAM_CHECK_ENV}=0)"
+    ]
+
+
+def test_the_budget_logs_an_unreadable_host(monkeypatch):
+    _host(monkeypatch, available_mib = None)
+    records = []
+
+    class _LogSpy:
+        def info(self, event, *args):
+            records.append(event % args if args else event)
+
+    budget = conv.HostRamBudget("widen.safetensors", "widening its weights", _LogSpy())
+    assert budget.available_mib is None
+    assert records == [
+        "diffusion.single_file: host RAM budget widen.safetensors: inactive (host RAM unreadable)"
+    ]
+
+
 def test_no_swap_converter_reads_commit_once_across_estimate_and_live_charges(monkeypatch):
     _host(monkeypatch, available_mib = 32 * 1024, total_mib = 64 * 1024)
     monkeypatch.setenv(small_host.NO_SWAP_ENV, "1")

@@ -9,6 +9,7 @@ import json
 import struct
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -272,13 +273,78 @@ def test_the_pipeline_decision_passes_the_commit_headroom_and_logs_a_dense_decis
 
     d = decide(None)
     assert not d.engaged and d.refuse is None
-    assert records[-1] == f"diffusion.small_host: engaged=False ({d.reason})"
+    assert (
+        records[-1]
+        == f"diffusion.small_host: engaged=False ({d.reason}); snapshot={tmp_path.name}"
+    )
     d = decide(30 * 1024)
     assert d.engaged and d.refuse is None and d.commit_mib == 30 * 1024
     assert (
         records[-1].startswith("diffusion.small_host: engaged=True (")
         and "commit headroom" in records[-1]
+        and f"snapshot={tmp_path.name}" in records[-1]
     )
+
+
+def test_the_pipeline_decision_logs_a_non_applicable_load_with_the_snapshot(
+    tmp_path, monkeypatch
+):
+    from core.inference import diffusion as dif
+
+    records = []
+
+    class _LogSpy:
+        def info(self, event, *args):
+            records.append(event % args if args else event)
+
+    monkeypatch.setattr(dif, "host_ram_mib", lambda: (64 * 1024, 32 * 1024))
+    monkeypatch.setattr(dif, "stored_components", lambda snapshot: dict(FLUX1))
+    monkeypatch.setattr(dif, "logger", _LogSpy())
+    d = dif.DiffusionBackend()._small_host_decision(
+        str(tmp_path), {}, types.SimpleNamespace(device = "cpu"), torch.float16, lora_active = False
+    )
+    assert d is not None and not d.engaged and d.reason == "not a CUDA load"
+    assert (
+        records[-1]
+        == f"diffusion.small_host: not applicable ({d.reason}); snapshot={tmp_path.name}"
+    )
+
+
+def test_the_snapshot_log_name_prefers_the_hub_cache_repo_folder():
+    from core.inference.diffusion import _snapshot_log_name
+
+    hub = Path("/cache/models--unsloth--Qwen-Image-2.1-GGUF/snapshots/abc123")
+    assert _snapshot_log_name(hub) == "models--unsloth--Qwen-Image-2.1-GGUF"
+    assert _snapshot_log_name(Path("/models/local-name")) == "local-name"
+
+
+def test_the_engaged_reason_names_the_host_total_the_route_and_a_suppressed_refusal(
+    tmp_path, monkeypatch
+):
+    from core.inference import diffusion as dif
+
+    records = []
+
+    class _LogSpy:
+        def info(self, event, *args):
+            records.append(event % args if args else event)
+
+    monkeypatch.setattr(dif, "host_ram_mib", lambda: (64 * 1024, 3000))
+    monkeypatch.setattr(dif, "host_commit_mib", lambda: 50 * 1024)
+    monkeypatch.setattr(dif, "stored_components", lambda snapshot: dict(FLUX1))
+    monkeypatch.setattr(dif, "pread_available", lambda: False)
+    monkeypatch.setattr(dif, "spill_capacity_mib", lambda: None)
+    monkeypatch.setattr(dif, "logger", _LogSpy())
+    monkeypatch.setenv(sh.NO_SWAP_ENV, "1")
+    monkeypatch.setenv(sh.HOST_RAM_CHECK_ENV, "0")
+    d = dif.DiffusionBackend()._small_host_decision(
+        str(tmp_path), {}, types.SimpleNamespace(device = "cuda"), torch.float16, lora_active = False
+    )
+    assert d.engaged and d.refuse is None
+    assert "host total ~65536 MiB" in d.reason
+    assert f"low-memory route ~{d.route_host_mib} MiB" in d.reason
+    assert f"refusal suppressed by {sh.HOST_RAM_CHECK_ENV}=0" in d.reason
+    assert d.reason in records[-1]
 
 
 def test_lora_keeps_the_dense_load():
