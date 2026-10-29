@@ -11,6 +11,12 @@
 
 import os, importlib.util, platform, sys
 
+# Restored at the end of this file.
+from ._import_gc import raise_gc_threshold as _raise_gc_threshold
+
+_raise_gc_threshold(sys.modules.get(__name__))
+del _raise_gc_threshold
+
 os.environ["UNSLOTH_IS_PRESENT"] = "1"
 
 # Opt into ROCm AOTriton kernels torch still gates as experimental; setdefault keeps an explicit "0".
@@ -1696,7 +1702,10 @@ else:
     _install_native_trainer_init()
     del _install_native_trainer_init
 
-    if os.environ.get("UNSLOTH_TP_SIZE", "").strip() not in ("", "1"):
+    if any(
+        os.environ.get(_name, "").strip() not in ("", "1")
+        for _name in ("UNSLOTH_TP_SIZE", "UNSLOTH_PP_SIZE")
+    ):
         from .models.tp_env import (
             install_tensor_parallel_env_trainer_init as _install_tp_trainer_init,
         )
@@ -1758,3 +1767,8 @@ try:
     del _fix_dill
 except Exception:
     pass
+
+from ._import_gc import restore_gc_threshold as _restore_gc_threshold
+
+_restore_gc_threshold()
+del _restore_gc_threshold
