@@ -766,19 +766,18 @@ def _is_hub_reference(reference: str) -> bool:
     )
 
 
-def grant_resident_components(status: dict, modality: str | None = None) -> None:
+def grant_resident_components(status: dict, references: tuple[str | None, ...] = ()) -> None:
     """Grant the loading account every component a later generate may re-check.
 
     A grant is only recorded when a download completes, so a model already in the
     cache would load and then refuse to generate. The successful load proves this
     account's access: grant the status identities (repo id and the resolved base)
-    plus the components the load recorded, a superset of what generate re-checks.
+    plus the request components captured before its worker started. The global
+    resident record can still belong to a previous load and must not grant access.
     """
     if not managed_account():
         return
-    references = list(resident_components(status, modality))
-    primary, components = _resident_components.get(modality or "", ("", frozenset()))
-    references.extend([primary, *sorted(components)])
+    references = (status.get("repo_id"), status.get("base_repo"), *references)
     for reference in dict.fromkeys(r for r in references if isinstance(r, str) and r):
         if _is_hub_reference(reference):
             record_model_grant(reference)

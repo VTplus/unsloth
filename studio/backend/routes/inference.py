@@ -47760,6 +47760,13 @@ async def load_diffusion_model_gated(
         ):
             needs_gpu = False
 
+        load_references = (
+            request.model_path,
+            request.base_repo,
+            *account_access.media_adapter_references(request),
+            *(r for r in account_access.media_component_file_references(request) if r),
+        )
+
         def _start_engine_load():
             # Recorded here: past the busy guard, arbiter and retirement check, before the worker gets the token.
             for _ref in _media_repos_to_record:
@@ -47797,6 +47804,7 @@ async def load_diffusion_model_gated(
                 # Uses the winner this route ranked and preflighted, not a card picked from VRAM that moved since.
                 gpu_ordinal = gpu_ordinal,
                 **_component_file_kwargs(request),
+                **({"grant_references": load_references} if activated == ENGINE_DIFFUSERS else {}),
                 # Only when set: the native engines take no such argument.
                 **({"allow_oversized_load": True} if request.allow_oversized_load else {}),
                 **_fallback_gate_kwarg(
@@ -47889,13 +47897,7 @@ async def load_diffusion_model_gated(
             extract_quant_token(request.gguf_filename) if kind == "gguf" else None,
             user_action = user_initiated,
         )
-        account_access.note_resident_components(
-            "diffusion",
-            request.model_path,
-            request.base_repo,
-            *account_access.media_adapter_references(request),
-            *(r for r in account_access.media_component_file_references(request) if r),
-        )
+        account_access.note_resident_components("diffusion", *load_references)
         reset_media_load_progress("image")
         status_dict = {
             **status_dict,

@@ -269,6 +269,8 @@ def _drive_load_route(
     training_active,
     video_engine = None,
     video_loading = None,
+    on_begin_load = None,
+    on_note_components = None,
 ):
     """Run the real image-load route with every hardware and engine answer stubbed; returns the
     route calls in order, plus what the route raised."""
@@ -283,11 +285,15 @@ def _drive_load_route(
     from routes import inference as route
 
     calls: list[str] = []
+    def begin_load(*args, **kwargs):
+        calls.append("begin_load")
+        return on_begin_load(*args, **kwargs) if on_begin_load is not None else {}
+
     backend = SimpleNamespace(
         validate_load_request = lambda *_a, **_k: detect_family("z-image"),
         preflight_base_access = lambda *_a, **_k: None,
         assert_precision_available = lambda *_a, **_k: None,
-        begin_load = lambda *_a, **_k: calls.append("begin_load") or {},
+        begin_load = begin_load,
     )
 
     async def _no_ordinal(*_a, **_k):
@@ -321,7 +327,11 @@ def _drive_load_route(
     monkeypatch.setattr(route, "_assert_native_precision_unset", lambda **_k: None)
     monkeypatch.setattr(route, "_repo_is_in_the_hub_cache", lambda *_a: True)
     monkeypatch.setattr(account_access, "admit_media_load", lambda _k, fn, *_a: fn())
-    monkeypatch.setattr(account_access, "note_resident_components", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        account_access,
+        "note_resident_components",
+        on_note_components if on_note_components is not None else lambda *_a, **_k: None,
+    )
 
     monkeypatch.setattr(
         "core.inference.video.get_video_backend",
@@ -355,6 +365,44 @@ def test_an_off_torch_native_load_is_admitted_during_training(monkeypatch):
     assert raised is None, raised
     assert "training_guard" not in calls
     assert calls[-1] == "begin_load"
+
+
+@pytest.mark.parametrize("engine", [ENGINE_DIFFUSERS, ENGINE_SD_CPP])
+def test_the_route_passes_its_component_snapshot_before_registering_the_resident(monkeypatch, engine):
+    from hub.services.models import account_access
+
+    events = []
+    expected = ("org/image", None, "bob/private-lora", "bob/private-encoder")
+    monkeypatch.setattr(
+        account_access, "media_adapter_references", lambda _request: ["bob/private-lora"]
+    )
+    monkeypatch.setattr(
+        account_access,
+        "media_component_file_references",
+        lambda _request: ["bob/private-encoder", None],
+    )
+
+    def begin_load(_repo_id, **kwargs):
+        if engine == ENGINE_DIFFUSERS:
+            assert kwargs["grant_references"] == expected
+        else:
+            assert "grant_references" not in kwargs
+        events.append("worker")
+        return {}
+
+    def note_components(modality, *references):
+        assert modality == "diffusion" and references == expected
+        events.append("registered")
+
+    _, raised = _drive_load_route(
+        monkeypatch,
+        predicted = engine,
+        training_active = False,
+        on_begin_load = begin_load,
+        on_note_components = note_components,
+    )
+    assert raised is None, raised
+    assert events == ["worker", "registered"]
 
 
 def test_diffusion_training_keeps_an_off_torch_images_model(monkeypatch):

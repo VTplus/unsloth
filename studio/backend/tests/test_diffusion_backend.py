@@ -3580,6 +3580,29 @@ def test_prefetch_aborts_when_cancelled(tmp_path):
         )
 
 
+def test_begin_load_freezes_grant_references_before_starting_the_worker(fake_runtime, monkeypatch):
+    import core.inference.diffusion as diffusion
+
+    references = ["org/pick", "bob/private-lora"]
+    dispatched = {}
+
+    def start_thread(*, kwargs, **_thread_options):
+        def start():
+            references.append("alice/private-lora")
+            dispatched.update(kwargs)
+
+        return types.SimpleNamespace(start = start)
+
+    monkeypatch.setattr(diffusion, "account_thread", start_thread)
+    DiffusionBackend().begin_load(
+        "unsloth/Z-Image-Turbo-GGUF",
+        gguf_filename = "z-image-turbo-Q4_K_S.gguf",
+        grant_references = references,
+    )
+
+    assert dispatched["grant_references"] == ("org/pick", "bob/private-lora")
+
+
 def test_each_load_owns_its_cancel_event(fake_runtime, monkeypatch, tmp_path):
     # unload() drops _loading, so a replacement starts while the old worker still prefetches;
     # a shared Event would let the replacement's clear() un-cancel it.

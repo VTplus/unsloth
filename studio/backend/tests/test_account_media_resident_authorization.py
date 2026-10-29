@@ -463,7 +463,12 @@ def test_a_successful_load_grants_the_generate_components_to_the_loading_account
     run_as(
         BOB, access.note_resident_components, "diffusion", "org/public-model", "bob/private-lora"
     )
-    run_as(BOB, access.grant_resident_components, status, "diffusion")
+    run_as(
+        BOB,
+        access.grant_resident_components,
+        status,
+        ("org/public-model", "bob/private-lora"),
+    )
     assert run_as(BOB, access.model_grants) == {
         "model:org/public-model",
         "model:krea/krea-2-turbo",
@@ -488,8 +493,42 @@ def test_a_local_base_is_never_granted():
         "family": "z-image",
         "base_repo": "E:\\models\\krea-2",
     }
-    run_as(BOB, access.grant_resident_components, status, "diffusion")
+    run_as(BOB, access.grant_resident_components, status)
     assert run_as(BOB, access.model_grants) == {"model:org/public-model"}
+
+
+@pytest.mark.parametrize("previous_primary", ["alice/previous-model", "org/public-model"])
+def test_a_load_grants_its_snapshot_before_the_route_replaces_the_previous_components(
+    previous_primary,
+):
+    """The worker can commit while the route still holds the previous account's record."""
+    run_as(
+        ALICE,
+        access.note_resident_components,
+        "diffusion",
+        previous_primary,
+        "alice/private-base",
+        "alice/private-lora",
+    )
+    previous = access._resident_components["diffusion"]
+    status = {
+        "loaded": True,
+        "repo_id": "org/public-model",
+        "base_repo": "bob/resolved-base",
+    }
+    references = ("org/cache-pick", "bob/private-lora", "bob/private-encoder")
+
+    run_as(BOB, access.grant_resident_components, status, references)
+
+    assert run_as(BOB, access.model_grants) == {
+        "model:org/public-model",
+        "model:bob/resolved-base",
+        "model:org/cache-pick",
+        "model:bob/private-lora",
+        "model:bob/private-encoder",
+    }
+    assert run_as(ALICE, access.model_grants) == set()
+    assert access._resident_components["diffusion"] == previous
 
 
 def test_a_failed_load_grants_nothing(monkeypatch):
@@ -513,9 +552,9 @@ def test_the_load_grants_only_after_the_resident_commits():
     """A failed load must not grant: the call sits after the commit and inside its guard."""
     from pathlib import Path
 
-    source = (
-        Path(__file__).resolve().parents[1] / "core/inference/diffusion.py"
-    ).read_text(encoding = "utf-8")
+    source = (Path(__file__).resolve().parents[1] / "core/inference/diffusion.py").read_text(
+        encoding = "utf-8"
+    )
     commit = source.index("state_committed = True")
     guard = source.index("if state_committed:", commit)
     grant = source.index("grant_resident_components(self.status()", guard)

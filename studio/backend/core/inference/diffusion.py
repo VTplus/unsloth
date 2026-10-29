@@ -5137,6 +5137,7 @@ class DiffusionBackend:
         text_encoder_files: Optional[Sequence[str]] = None,
         vae_file: Optional[str] = None,
         allow_oversized_load: bool = False,
+        grant_references: Sequence[str | None] = (),
         _load_token: Optional[int] = None,
     ) -> dict[str, Any]:
         """Validate, then run the (slow) load on a daemon thread. Returns at once."""
@@ -5251,6 +5252,7 @@ class DiffusionBackend:
                 text_encoder_files = list(text_encoder_files or ()) or None,
                 vae_file = vae_file,
                 allow_oversized_load = bool(allow_oversized_load),
+                grant_references = tuple(grant_references),
                 _load_token = token,
                 _cancel_event = cancel_event,
                 _gpu_ordinals = gpu_ordinals,
@@ -7847,6 +7849,7 @@ class DiffusionBackend:
         gpu_ordinal: Optional[int] = None,
         # Read by ``scoped_allow_oversized_load``.
         allow_oversized_load: bool = False,
+        grant_references: tuple[str | None, ...] = (),
         _load_token: Optional[int] = None,
         _base_local_dir: Optional[str] = None,
         # Only when True may the dense-quant fallback materialise transformer/ shards; default for direct calls.
@@ -10754,7 +10757,7 @@ class DiffusionBackend:
                         # The successful load proves this account's access; generate re-checks these components.
                         try:
                             from hub.services.models import account_access
-                            account_access.grant_resident_components(self.status(), "diffusion")
+                            account_access.grant_resident_components(self.status(), grant_references)
                         except Exception:  # noqa: BLE001 - bookkeeping never fails a load
                             logger.debug("resident component grant failed", exc_info = True)
                     try:
