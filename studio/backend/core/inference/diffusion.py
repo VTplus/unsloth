@@ -10757,7 +10757,9 @@ class DiffusionBackend:
                         # The successful load proves this account's access; generate re-checks these components.
                         try:
                             from hub.services.models import account_access
-                            account_access.grant_resident_components(self.status(), grant_references)
+                            account_access.grant_resident_components(
+                                self.status(), grant_references
+                            )
                         except Exception:  # noqa: BLE001 - bookkeeping never fails a load
                             logger.debug("resident component grant failed", exc_info = True)
                     try:

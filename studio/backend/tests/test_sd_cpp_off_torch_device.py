@@ -285,6 +285,7 @@ def _drive_load_route(
     from routes import inference as route
 
     calls: list[str] = []
+
     def begin_load(*args, **kwargs):
         calls.append("begin_load")
         return on_begin_load(*args, **kwargs) if on_begin_load is not None else {}
@@ -368,7 +369,9 @@ def test_an_off_torch_native_load_is_admitted_during_training(monkeypatch):
 
 
 @pytest.mark.parametrize("engine", [ENGINE_DIFFUSERS, ENGINE_SD_CPP])
-def test_the_route_passes_its_component_snapshot_before_registering_the_resident(monkeypatch, engine):
+def test_the_route_passes_its_component_snapshot_before_registering_the_resident(
+    monkeypatch, engine
+):
     from hub.services.models import account_access
 
     events = []
