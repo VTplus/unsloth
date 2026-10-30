@@ -550,6 +550,7 @@ def test_a_failed_load_grants_nothing(monkeypatch):
 
 def test_the_load_grants_only_after_the_resident_commits():
     """A failed load must not grant: the call sits after the commit and inside its guard."""
+    import re
     from pathlib import Path
 
     source = (Path(__file__).resolve().parents[1] / "core/inference/diffusion.py").read_text(
@@ -557,7 +558,12 @@ def test_the_load_grants_only_after_the_resident_commits():
     )
     commit = source.index("state_committed = True")
     guard = source.index("if state_committed:", commit)
-    grant = source.index("grant_resident_components(self.status()", guard)
+    grant_match = re.search(
+        r"grant_resident_components\(\s*self\.status\(\),\s*grant_references\s*\)",
+        source[guard:],
+    )
+    assert grant_match is not None
+    grant = guard + grant_match.start()
     assert commit < guard < grant
     guard_indent = len(source[:guard].rsplit("\n", 1)[-1])
     grant_indent = len(source[:grant].rsplit("\n", 1)[-1])
