@@ -3645,3 +3645,111 @@ def test_an_unresolved_pin_judges_every_visible_card(monkeypatch, resolved, expe
     _run_server_load(monkeypatch, b, servers, device = "cuda", gpu_ordinal = 1)
     assert servers[-1].env == expected
     assert dict(b._state.child_env) == (expected or {})
+
+
+def test_native_batch_uses_image_markers_not_step_resets():
+    b = SdCppDiffusionBackend(engine = _FakeEngine())
+    b._gen = bk._SdGen(total_steps = 8, batch = bk.ImageBatchProgress(10))
+    b._begin_native_batch(8, 2)
+    b._on_log("generating image: 1/2 - seed 42")
+    assert b.generate_progress()["batch"]["step"] == 0
+    b._on_log("sampling 4/8")
+    p = b.generate_progress()["batch"]
+    assert (p["start"], p["end"]) == (9, 9)
+    assert p["fraction"] == pytest.approx(0.85)
+    b._on_log("generating image: 1/2 - seed 42")
+    assert b.generate_progress()["batch"] == p
+    b._on_log("generating image: 2/99 - seed 43")
+    assert b.generate_progress()["batch"] == p
+    b._on_log("generating image: 2/2 - seed 43")
+    p = b.generate_progress()["batch"]
+    assert (p["start"], p["step"], p["eta_seconds"]) == (10, 0, None)
+    b._on_log("generating image: 1/2 - seed 42")
+    assert b.generate_progress()["batch"] == p
+    b._on_log("decoding 2/2 latents")
+    assert b.generate_progress()["phase"] == "decode"
+    assert b.generate_progress()["batch"] == p
+    # A replacement server retries the failed native request, rather than inventing more images.
+    b._begin_native_batch(8, 2)
+    assert b.generate_progress()["batch"]["start"] == 9
+
+
+def test_native_hires_pass_and_cli_boundary_keep_the_correct_image():
+    b = SdCppDiffusionBackend(engine = _FakeEngine())
+    b._gen = bk._SdGen(total_steps = 12, passes = (8, 4), batch = bk.ImageBatchProgress(3))
+    b._begin_native_batch(0, 1)
+    b._on_log("sampling 8/8")
+    b._on_log("sampling 2/4")
+    p = b.generate_progress()["batch"]
+    assert (p["start"], p["step"], p["total_steps"]) == (1, 10, 12)
+    b._begin_native_batch(1, 1)
+    b._on_log("generating image: 1/1 - seed 43")
+    b._on_log("sampling 1/8")
+    p = b.generate_progress()["batch"]
+    assert (p["start"], p["step"]) == (2, 1)
+
+
+@pytest.mark.parametrize("batch_size", [3, 10])
+def test_native_generate_reports_every_image_across_server_requests(monkeypatch, batch_size):
+    b = SdCppDiffusionBackend()
+    servers = []
+    _run_server_load(monkeypatch, b, servers)
+    server = servers[0]
+    real_generate = server.img_gen
+    seen = []
+
+    def observe(payload, *, on_step, **kwargs):
+        count = payload["batch_count"]
+        for index in range(1, count + 1):
+            on_step(f"generating image: {index}/{count} - seed 42")
+            on_step("sampling 4/8")
+            seen.append(b.generate_progress()["batch"])
+            on_step("sampling 8/8")
+        return real_generate(payload, on_step = on_step, **kwargs)
+
+    monkeypatch.setattr(server, "img_gen", observe)
+    out = b.generate(prompt = "x", steps = 8, seed = 1, batch_size = batch_size)
+    assert len(out["images"]) == batch_size
+    assert [p["start"] for p in seen] == list(range(1, batch_size + 1))
+    assert all(p["end"] == p["start"] and p["total"] == batch_size for p in seen)
+    assert [p["fraction"] for p in seen] == pytest.approx(
+        [(index + 0.5) / batch_size for index in range(batch_size)]
+    )
+    assert b.generate_progress()["active"] is False
+
+
+def test_single_native_image_retains_the_existing_phase_fallback():
+    b = SdCppDiffusionBackend(engine = _FakeEngine())
+    b._gen = bk._SdGen(total_steps = 8, batch = bk.ImageBatchProgress(1))
+    b._begin_native_batch(0, 1)
+    b._on_log("sampling 4/8")
+    assert b.generate_progress()["phase"] is None
+    b._on_log("decoding 1 latents")
+    assert b.generate_progress()["phase"] is None
+
+
+def test_out_of_order_image_markers_never_rewind_the_batch():
+    b = SdCppDiffusionBackend(engine = _FakeEngine())
+    b._gen = bk._SdGen(total_steps = 8, batch = bk.ImageBatchProgress(10))
+    b._begin_native_batch(8, 2)
+    b._on_log("generating image: 2/2 - seed 43")
+    p = b.generate_progress()["batch"]
+    assert (p["start"], p["step"]) == (10, 0)
+    b._on_log("sampling 4/8")
+    assert b.generate_progress()["batch"]["step"] == 4
+    b._on_log("generating image: 1/2 - seed 42")
+    q = b.generate_progress()["batch"]
+    assert (q["start"], q["end"], q["step"]) == (10, 10, 4)
+
+
+def test_sampling_lines_after_a_decode_line_do_not_move_the_progress():
+    b = SdCppDiffusionBackend(engine = _FakeEngine())
+    b._gen = bk._SdGen(total_steps = 8, batch = bk.ImageBatchProgress(2))
+    b._begin_native_batch(0, 1)
+    b._on_log("sampling 4/8")
+    b._on_log("decoding 1 latents")
+    assert b.generate_progress()["phase"] == "decode"
+    b._on_log("sampling 6/8")
+    p = b.generate_progress()
+    assert (p["step"], p["phase"]) == (4, "decode")
+    assert p["batch"]["step"] == 4

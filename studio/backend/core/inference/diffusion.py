@@ -118,6 +118,7 @@ from .diffusion_device import (
     resolve_selected_cuda_ordinals,
 )
 from .diffusion_cfg_batch import cfg_batch_status, end_cfg_batch_render, install_cfg_batch
+from .diffusion_batch_progress import ImageBatchProgress
 from .diffusion_zimage_cfg_split import (
     install_zimage_cfg_split,
     split_aware_request_extra,
@@ -1706,6 +1707,7 @@ class _GenState:
     phase: str = "encode"
     preview: Optional[str] = None
     preview_seq: int = 0
+    batch: Optional[ImageBatchProgress] = None
 
 
 def _estimate_eta(total_steps: int, step: int, first_step_at: float, now: float) -> Optional[float]:
@@ -14185,7 +14187,12 @@ class DiffusionBackend:
                     if _hires_pass is not None and _hires_pass.refine
                     else steps
                 )
-                gen = _GenState(total_steps = progress_steps * len(chunks))
+                gen = _GenState(
+                    total_steps = progress_steps * len(chunks),
+                    # Hires owns multiple calls; a single pass cannot describe that entire batch.
+                    batch = ImageBatchProgress(len(jobs)) if _hires_pass is None else None,
+                )
+                images_done = 0
                 # Steps completed by FINISHED chunks, so the bar spans the whole multi-chunk call (mutable cell for
                 # _on_step).
                 steps_done = [0]
@@ -14240,6 +14247,8 @@ class DiffusionBackend:
                 def _report(done_in_chunk: int) -> None:
                     if gen.phase not in ("encode", "denoise"):
                         return
+                    if gen.batch is not None:
+                        gen.batch.update(done_in_chunk)
                     done = steps_done[0] + max(0, min(int(done_in_chunk), progress_steps))
                     if done <= gen.step:
                         return
@@ -14402,6 +14411,8 @@ class DiffusionBackend:
                     pending = list(chunks)
                     while pending:
                         chunk = pending.pop(0)
+                        if gen.batch is not None:
+                            gen.batch.begin(images_done, len(chunk), progress_steps)
                         chunk_kwargs = dict(kwargs)
                         shared = uniform_prompt(chunk)
                         generators = [
@@ -14598,6 +14609,7 @@ class DiffusionBackend:
                             per_image_seeds.extend(s for _, s in chunk)
                         chunk_shapes.append(len(chunk))
                         steps_done[0] += progress_steps
+                        images_done += len(chunk)
                 except BaseException:
                     if previewer is not None:
                         previewer.finish()
@@ -14823,6 +14835,7 @@ class DiffusionBackend:
             "phase": gen.phase,
             "preview": gen.preview,
             "preview_seq": gen.preview_seq,
+            "batch": gen.batch.snapshot() if gen.batch is not None else None,
         }
 
     def cancel_generate(self, expected_account: Optional[str] = None) -> bool:

@@ -2,7 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 export interface MediaGeneratePhaseProgress {
-  // enhance (FLUX.3 prompt upsampler) | encode | denoise | decode | export (video); absent or null (sd.cpp) reads as
+  // enhance (FLUX.3 prompt upsampler) | encode | denoise | decode | export (video); absent or null reads as
   // denoise.
   phase?: string | null;
   step: number;
@@ -27,12 +27,41 @@ export function generatePhaseLabel(
   return `${base} \u2022 Step ${p.step}/${p.total}${eta ? ` · ~${eta}` : ""}`;
 }
 
+interface ComparableGenerateProgress {
+  step: number;
+  total_steps?: number;
+  fraction?: number;
+  eta_seconds?: number | null;
+  phase?: string | null;
+  preview_seq?: number;
+  batch?: {
+    total: number;
+    start: number;
+    end: number;
+    step: number;
+    total_steps: number;
+    fraction: number;
+    eta_seconds: number | null;
+    total_eta_seconds: number | null;
+  } | null;
+}
+
 export function sameGenerateProgress(
-  a: { step: number; eta_seconds?: number | null; phase?: string | null; preview_seq?: number },
-  b: { step: number; eta_seconds?: number | null; phase?: string | null; preview_seq?: number },
+  a: ComparableGenerateProgress,
+  b: ComparableGenerateProgress,
 ): boolean {
   return (
     a.step === b.step &&
+    a.total_steps === b.total_steps &&
+    a.fraction === b.fraction &&
+    a.batch?.total === b.batch?.total &&
+    a.batch?.start === b.batch?.start &&
+    a.batch?.end === b.batch?.end &&
+    a.batch?.step === b.batch?.step &&
+    a.batch?.total_steps === b.batch?.total_steps &&
+    a.batch?.fraction === b.batch?.fraction &&
+    a.batch?.eta_seconds === b.batch?.eta_seconds &&
+    a.batch?.total_eta_seconds === b.batch?.total_eta_seconds &&
     a.eta_seconds === b.eta_seconds &&
     a.phase === b.phase &&
     (a.preview_seq ?? 0) === (b.preview_seq ?? 0)

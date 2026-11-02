@@ -14541,3 +14541,36 @@ def test_a_lora_change_drops_the_cfg_parallel_replica(monkeypatch):
     assert dropped == [pipe]
     backend._apply_loras(_quant_lora_state(pipe), [], ev)
     assert dropped == [pipe, pipe]
+
+
+@pytest.mark.parametrize("split_after_oom", [False, True])
+def test_image_batch_progress_tracks_parallel_chunks_and_oom_retry(
+    fake_runtime, tmp_path, split_after_oom
+):
+    backend = _load_zimage_backend(tmp_path)
+    seen = []
+
+    class ProgressPipe(_CountingPipe):
+        def __call__(
+            self,
+            *,
+            prompt = None,
+            callback_on_step_end = None,
+            **kwargs,
+        ):
+            for index in range(kwargs["num_inference_steps"]):
+                callback_on_step_end(self, index, None, {})
+                seen.append(backend.generate_progress()["batch"])
+            return super().__call__(prompt = prompt, **kwargs)
+
+    pipe = ProgressPipe(max_images = 2 if split_after_oom else None)
+    object.__setattr__(backend._state, "pipe", pipe)
+    out = backend.generate(
+        prompt = "p", seeds = [1, 2, 3, 4], steps = 4, batch_size = 4 if split_after_oom else 2
+    )
+    assert len(out["images"]) == 4
+    assert pipe.batch_attempts == ([4, 2, 2] if split_after_oom else [2, 2])
+    first = seen[4] if split_after_oom else seen[0]
+    assert (first["start"], first["end"], first["step"]) == (1, 2, 1)
+    assert first["fraction"] == pytest.approx(0.125)
+    assert (seen[-1]["start"], seen[-1]["end"], seen[-1]["fraction"]) == (3, 4, 1.0)

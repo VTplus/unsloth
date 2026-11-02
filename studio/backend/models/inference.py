@@ -5838,8 +5838,39 @@ class PromptUpsamplerPreviewResponse(BaseModel):
     enhanced_prompt: str = Field(..., description = "The caption the upsampler wrote")
 
 
+class DiffusionImageBatchProgress(BaseModel):
+    """Sampling progress of image jobs, before decoding and gallery persistence finish."""
+
+    total: int = Field(..., ge = 1, description = "Image jobs in this API request, not output layers")
+    start: int = Field(..., ge = 1, description = "First current image job, 1-based")
+    end: int = Field(..., ge = 1, description = "Last current image job, inclusive")
+    step: int = Field(..., ge = 0, description = "Sampling steps completed in the current group")
+    total_steps: int = Field(..., ge = 1, description = "Sampling steps in the current group")
+    fraction: float = Field(..., ge = 0.0, le = 1.0, description = "Whole-batch denoising fraction")
+    eta_seconds: Optional[float] = Field(
+        None, ge = 0.0, description = "Current group's sampling ETA; excludes decode and persistence"
+    )
+    total_eta_seconds: Optional[float] = Field(
+        None,
+        ge = 0.0,
+        description = (
+            "Whole-batch sampling ETA; null until the first observed step, excludes decode and persistence"
+        ),
+    )
+
+    @model_validator(mode = "after")
+    def keep_the_group_inside_the_batch(self):
+        """A group reports real image jobs: the range fits the batch, its steps fit the group."""
+
+        if self.end < self.start or self.end > self.total or self.step > self.total_steps:
+            raise ValueError("The image group must stay inside the batch and its step budget")
+        return self
+
+
 class DiffusionGenerateProgressResponse(BaseModel):
     """Live per-step progress for an in-flight generation."""
+
+    batch: Optional[DiffusionImageBatchProgress] = None
 
     active: bool = Field(False, description = "Whether a generation is running")
     step: int = Field(0, description = "Denoising steps completed so far")
@@ -5849,7 +5880,7 @@ class DiffusionGenerateProgressResponse(BaseModel):
     phase: Optional[str] = Field(
         None,
         description = "enhance (FLUX.3 prompt upsampling, before the run) | encode | denoise | decode; null "
-        "from engines that report no phase (sd.cpp)",
+        "when an engine reports no phase",
     )
     preview: Optional[str] = Field(
         None, description = "Live latent preview of the image being denoised, as a JPEG data URL"

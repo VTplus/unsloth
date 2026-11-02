@@ -138,13 +138,28 @@ export interface DiffusionConditioning {
 
 export type LocalizedEditMode = "annotate" | "paint" | "mask";
 
+export interface DiffusionImageBatchProgress {
+  total: number;
+  start: number;
+  end: number;
+  step: number;
+  total_steps: number;
+  // Whole-batch denoising only: decode and gallery persistence may still be running at 1.
+  fraction: number;
+  // Current image/group sampling ETA, excluding decode and persistence.
+  eta_seconds: number | null;
+  // Whole-batch sampling ETA; null until the first observed step. Excludes decode and persistence.
+  total_eta_seconds: number | null;
+}
+
 export interface DiffusionGenerateProgress {
+  batch?: DiffusionImageBatchProgress | null;
   active: boolean;
   step: number;
   total_steps: number;
   fraction: number;
   eta_seconds: number | null;
-  // Absent (sd.cpp engine) means "denoise". "encode" runs before the denoise loop starts; "enhance" is the FLUX.3
+  // Absent (older engines or single-image sd.cpp) means "denoise". "encode" runs before the denoise loop starts; "enhance" is the FLUX.3
   // prompt upsampler writing the caption before the run (with `message`).
   phase?: "enhance" | "encode" | "denoise" | "decode" | null;
   message?: string | null;

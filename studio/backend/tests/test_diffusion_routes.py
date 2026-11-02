@@ -27,6 +27,8 @@ import core.inference.diffusion as diffusion_module
 import core.inference.gpu_arbiter as gpu_arbiter
 import core.inference.image_gallery as gallery_module
 from auth.authentication import authenticated_via_api_key, get_current_subject
+from models.inference import DiffusionImageBatchProgress
+from pydantic import ValidationError
 import routes.inference as inference_routes
 from routes.inference import studio_router
 
@@ -3537,3 +3539,55 @@ def test_zero_weight_loras_neither_refuse_mlx_nor_route_away_from_it(monkeypatch
     inference_routes._refuse_mlx_loras(off, z_image)
     with pytest.raises(HTTPException):
         inference_routes._refuse_mlx_loras(on, z_image)
+
+
+def test_generate_progress_exposes_optional_image_batch_data(client, monkeypatch):
+    batch = {
+        "total": 4,
+        "start": 2,
+        "end": 2,
+        "step": 7,
+        "total_steps": 20,
+        "fraction": 0.3375,
+        "eta_seconds": 26.0,
+        "total_eta_seconds": 130.0,
+    }
+    backend = diffusion_module.get_diffusion_backend()
+    monkeypatch.setattr(
+        backend,
+        "generate_progress",
+        lambda: {
+            "active": True,
+            "step": 7,
+            "total_steps": 20,
+            "fraction": 0.35,
+            "eta_seconds": 26.0,
+            "batch": batch,
+        },
+    )
+    response = client.get("/api/inference/images/generate-progress")
+    assert response.status_code == 200
+    assert response.json()["batch"] == batch
+
+
+@pytest.mark.parametrize(
+    "inconsistent",
+    [
+        {"start": 3, "end": 2},
+        {"end": 5},
+        {"step": 21},
+    ],
+)
+def test_an_inconsistent_image_group_is_rejected(inconsistent):
+    batch = {
+        "total": 4,
+        "start": 2,
+        "end": 2,
+        "step": 7,
+        "total_steps": 20,
+        "fraction": 0.3375,
+        "eta_seconds": 26.0,
+    }
+    batch.update(inconsistent)
+    with pytest.raises(ValidationError):
+        DiffusionImageBatchProgress(**batch)

@@ -186,6 +186,8 @@ import { getHfToken, hfApiToken } from "@/features/hub/stores/hf-token-store";
 import { formatBytes, formatEta } from "@/features/hub/lib/format";
 import { OnDeviceFoldersDialog } from "@/features/hub/catalog/on-device-folders-dialog";
 import { generatePhaseLabel, sameGenerateProgress } from "@/lib/media-generate-phase";
+import { Progress } from "@/components/ui/progress";
+import { imageBatchTitle, imageStepProgress, runFraction } from "./lib/batch-progress";
 import { NegativePromptField, PROMPT_BOX_CLASS } from "@/components/negative-prompt-field";
 import {
   ASPECT_RATIOS,
@@ -708,7 +710,8 @@ function formatTimestamp(epochSeconds: number): string {
 }
 
 function genStepLabel(p: DiffusionGenerateProgress): string {
-  return generatePhaseLabel({ ...p, total: p.total_steps }, { formatEta });
+  const current = imageStepProgress(p);
+  return generatePhaseLabel({ ...current, total: current.total_steps }, { formatEta });
 }
 
 const SETTLE_POLL_MS = 1000;
@@ -7352,17 +7355,50 @@ export function ImagesPage({
                 <div className="w-72 max-w-full rounded-xl bg-background/85 p-3 shadow-lg ring-1 ring-border backdrop-blur">
                   <ModelLoadDescription
                     className="min-h-0"
-                    title={
+                    title={[
                       compareRun && genDone != null
                         ? compareRun.title(genDone)
                         : genDone != null && count > 1
                           ? `Run ${genDone + 1}/${count}`
-                          : null
-                    }
+                          : null,
+                      imageBatchTitle(genStep),
+                    ].filter(Boolean).join(" · ") || null}
                     message="Starting…"
-                    progressPercent={genStep ? genStep.fraction * 100 : null}
+                    progressPercent={genStep ? imageStepProgress(genStep).fraction * 100 : null}
                     progressLabel={genStep ? genStepLabel(genStep) : null}
                   />
+                  {genStep?.batch && genStep.batch.total > 1 && (
+                    <div className="mt-2 pl-6">
+                      <div className="flex justify-between gap-2 text-ui-10 text-muted-foreground">
+                        <span>Batch denoising</span>
+                        <span className="tabular-nums">
+                          {Math.round(genStep.batch.fraction * 100)}%
+                          {genStep.batch.total_eta_seconds != null &&
+                            ` · ~${formatEta(genStep.batch.total_eta_seconds)}`}
+                        </span>
+                      </div>
+                      <Progress
+                        aria-label="Batch denoising"
+                        value={genStep.batch.fraction * 100}
+                        className="mt-1 h-1"
+                      />
+                    </div>
+                  )}
+                  {!compareRun && runFraction(count, genDone, genStep) != null && (
+                    <div className="mt-2 pl-6">
+                      <div className="flex justify-between gap-2 text-ui-10 text-muted-foreground">
+                        <span>Run progress</span>
+                        <span className="tabular-nums">
+                          {Math.round(runFraction(count, genDone, genStep)! * 100)}%
+                        </span>
+                      </div>
+                      <Progress
+                        aria-label="Run progress"
+                        value={runFraction(count, genDone, genStep)! * 100}
+                        className="mt-1 h-1"
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
             )}

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from core.inference.inference_gate import holds_inference, pauses_background_embedding
+from core.inference.diffusion_batch_progress import ImageBatchProgress
 from core.inference.diffusion_auto_policy import build_resolved_record, format_generation_for_log
 from core.inference.diffusion_compat import flux2_inner_dim_for_pick
 from core.inference.diffusion_device import (
@@ -117,6 +118,8 @@ logger = get_logger(__name__)
 
 # Only a denominator equal to the requested steps is trusted.
 _STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+_IMAGE_RE = re.compile(r"\bgenerating image:\s*(\d+)\s*/\s*(\d+)\b")
+_DECODE_RE = re.compile(r"\bdecoding \d+(?:/\d+)? latents\b")
 
 # Serialises the one-time binary install so concurrent first-loads don't race.
 _install_lock = threading.Lock()
@@ -2918,6 +2921,19 @@ class _SdGen:
     passes: tuple[int, ...] = ()
     pass_index: int = 0
     pass_offset: int = 0
+    batch: Optional[ImageBatchProgress] = None
+    native_offset: int = 0
+    native_count: int = 1
+    phase: Optional[str] = None
+
+    def begin_image(self, offset: int) -> None:
+        self.step = 0
+        self.first_step_at = 0.0
+        self.eta_seconds = None
+        self.pass_index = self.pass_offset = 0
+        self.phase = "encode"
+        if self.batch is not None:
+            self.batch.begin(offset, 1, self.total_steps)
 
 
 def _estimate_eta(total_steps: int, step: int, first_step_at: float, now: float) -> Optional[float]:
@@ -4521,7 +4537,10 @@ class SdCppDiffusionBackend:
                 self._active_generate_cancel = cancel
                 self._active_generate_account = current_account_id()
                 # Publish step 0 before slow setup so a reload probe does not read idle.
-                self._gen = _SdGen(total_steps = int(steps))
+                self._gen = _SdGen(
+                    total_steps = int(steps),
+                    batch = ImageBatchProgress(max(1, int(batch_size))),
+                )
             try:
                 ref_pngs: list[bytes] = []
                 edit_only = bool(getattr(state.family, "edit", False))
@@ -4600,7 +4619,9 @@ class SdCppDiffusionBackend:
                     )
                     # sd.cpp samples the base and Hires schedules separately, each reporting its own denominator.
                     passes = (int(steps), int(hires_plan.refine_steps))
-                    self._gen = _SdGen(total_steps = sum(passes), passes = passes)
+                    self._gen = _SdGen(
+                        total_steps = sum(passes), passes = passes, batch = self._gen.batch
+                    )
                 if seed is None:
                     seed = int.from_bytes(os.urandom(6), "big") & ((1 << 53) - 1)
                 else:
@@ -4856,6 +4877,7 @@ class SdCppDiffusionBackend:
                     hires = hires_payload,
                     extra_sample_args = _request_extra_sample_args(state),
                 )
+                self._begin_native_batch(offset, count)
                 try:
                     blobs = state.server.img_gen(
                         payload,
@@ -4914,6 +4936,7 @@ class SdCppDiffusionBackend:
                             # The replacement has its own scratch dir: stage the upscaler there again.
                             hires_payload = _stage_hires(server)
                             payload["hires"] = dict(hires_payload)
+                        self._begin_native_batch(offset, count)
                         try:
                             blobs = server.img_gen(
                                 payload,
@@ -5187,6 +5210,7 @@ class SdCppDiffusionBackend:
                 ref_path.write_bytes(blob)
                 ref_paths.append(str(ref_path))
             for index in range(max(1, int(batch_size))):
+                self._begin_native_batch(index, 1)
                 if cancel.is_set():
                     raise RuntimeError(DIFFUSION_CANCELLED_MSG)
                 # Mask to int64; 53 bits would collide large explicit seeds.
@@ -5241,9 +5265,31 @@ class SdCppDiffusionBackend:
                     seeds.append(seed_i)
         return images, seeds
 
+    def _begin_native_batch(self, offset: int, count: int) -> None:
+        gen = self._gen
+        if gen is not None:
+            gen.native_offset = offset
+            gen.native_count = count
+            gen.begin_image(offset)
+
     def _on_log(self, line: str) -> None:
         gen = self._gen
         if gen is None or gen.total_steps <= 0:
+            return
+        image = _IMAGE_RE.search(line)
+        if image is not None:
+            index, count = map(int, image.groups())
+            if gen.batch is not None and count == gen.native_count and 1 <= index <= count:
+                offset = gen.native_offset + index - 1
+                current = gen.batch.snapshot()
+                # Duplicate or delayed markers cannot reset an image's sampling clock.
+                if current is None or offset + 1 > current["start"]:
+                    gen.begin_image(offset)
+            return  # the marker's i/n is never a sampling step
+        if _DECODE_RE.search(line):
+            gen.phase = "decode"
+            return
+        if gen.phase == "decode":
             return
         for a, b in _STEP_RE.findall(line):
             a, b = int(a), int(b)
@@ -5270,6 +5316,9 @@ class SdCppDiffusionBackend:
             if gen.first_step_at == 0.0:
                 gen.first_step_at = now
             gen.eta_seconds = _estimate_eta(gen.total_steps, gen.step, gen.first_step_at, now)
+            gen.phase = "denoise"
+            if gen.batch is not None:
+                gen.batch.update(gen.step)
 
     def generate_progress(self) -> dict[str, Any]:
         gen = self._gen
@@ -5287,6 +5336,8 @@ class SdCppDiffusionBackend:
             "total_steps": gen.total_steps,
             "fraction": min(gen.step / gen.total_steps, 1.0),
             "eta_seconds": gen.eta_seconds,
+            "phase": gen.phase if gen.batch is not None and gen.batch.total > 1 else None,
+            "batch": gen.batch.snapshot() if gen.batch is not None else None,
         }
 
     def cancel_generate(self, expected_account: Optional[str] = None) -> bool:
