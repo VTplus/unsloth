@@ -133,3 +133,18 @@ def test_the_final_image_completes_the_whole_batch_eta_at_zero(monkeypatch):
     clock[0] = 2.0
     p.update(4)
     assert p.snapshot()["total_eta_seconds"] == 0
+
+
+def test_the_batch_eta_never_drops_below_the_step_estimate(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(bp.time, "monotonic", lambda: clock[0])
+    p = bp.ImageBatchProgress(2)
+    p.begin(1, 1, 4)
+    p.update(1)
+    clock[0] = 2.0
+    p.update(2)
+    s = p.snapshot()
+    assert s["eta_seconds"] == 4
+    # The batch extrapolation would give 2; the floor lifts it to the step
+    # estimate (additional timers never report less).
+    assert s["total_eta_seconds"] == 4

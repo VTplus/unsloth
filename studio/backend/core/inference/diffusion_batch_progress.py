@@ -81,6 +81,11 @@ class ImageBatchProgress:
                 total_eta = max(
                     0.0, (1.0 - fraction) * (now - anchor_at) / (fraction - anchor_fraction)
                 )
+                # Additional timers never report less than the step estimate of
+                # the same moment: the batch remainder covers at least the
+                # current group.
+                if eta is not None:
+                    total_eta = max(total_eta, eta)
         self._state = (
             offset,
             count,
