@@ -36,6 +36,7 @@ from typing import Any, Callable, Optional
 
 from core.inference.inference_gate import holds_inference, pauses_background_embedding
 from core.inference.diffusion_batch_progress import ImageBatchProgress
+from core.inference.load_progress_sampler import LoadProgressSampler
 from core.inference.diffusion_auto_policy import build_resolved_record, format_generation_for_log
 from core.inference.diffusion_compat import flux2_inner_dim_for_pick
 from core.inference.diffusion_device import (
@@ -3169,6 +3170,8 @@ class SdCppDiffusionBackend:
         # handover reads an unload and kills the healthy replacement.
         self._replacing_server: Optional[SdCppServer] = None
         self._gen: Optional[_SdGen] = None
+        # Weight-load progress of the active sd-server (read bytes vs the model files it was given).
+        self._load_sampler = LoadProgressSampler()
         # Set when an accelerator install was skipped for a busy tree; the load retries it once free.
         self._deferred_accelerator_install = False
         # Created here but unset: an explicit None would be this thread's answer forever.
@@ -5329,6 +5332,7 @@ class SdCppDiffusionBackend:
                 "total_steps": 0,
                 "fraction": 0.0,
                 "eta_seconds": None,
+                "load": None,
             }
         return {
             "active": True,
@@ -5338,7 +5342,24 @@ class SdCppDiffusionBackend:
             "eta_seconds": gen.eta_seconds,
             "phase": gen.phase if gen.batch is not None and gen.batch.total > 1 else None,
             "batch": gen.batch.snapshot() if gen.batch is not None else None,
+            "load": self._sample_load_progress(),
         }
+
+    def _sample_load_progress(self) -> Optional[dict[str, Any]]:
+        """Weight-load progress of the resident sd-server while it reads the model files.
+
+        Sampled on demand from the UI's progress poll; the sampler keeps a per-pid
+        high-water mark, so RSS dropping after the VRAM upload never regresses the bar.
+        """
+        state = self._state
+        server = getattr(state, "server", None) if state is not None else None
+        process = getattr(server, "_process", None) if server is not None else None
+        if process is None or process.poll() is not None:
+            return None
+        try:
+            return self._load_sampler.snapshot(process.pid, getattr(process, "args", None))
+        except Exception:
+            return None
 
     def cancel_generate(self, expected_account: Optional[str] = None) -> bool:
         """Native runner polls this event and kills the sd-cli process tree, so stop lands within

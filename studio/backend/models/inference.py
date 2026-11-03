@@ -5867,10 +5867,29 @@ class DiffusionImageBatchProgress(BaseModel):
         return self
 
 
+class DiffusionModelLoadProgress(BaseModel):
+    """Weight-load progress of the active sd-server process, sampled on demand."""
+
+    phase: Optional[Literal["loading", "ready"]] = Field(
+        None,
+        description = "'loading' while the model files are read, 'ready' once their bytes are in",
+    )
+    bytes_loaded: int = Field(
+        0, description = "Bytes the sd-server process has read (high-water mark)"
+    )
+    bytes_total: int = Field(0, description = "Sum of the model files on the server command line")
+    fraction: float = Field(0.0, description = "bytes_loaded / bytes_total, clamped to [0,1]")
+    vram_mb: Optional[int] = Field(None, description = "VRAM of the sd-server process in MiB")
+    eta_seconds: Optional[float] = Field(
+        None, description = "Always null in v1: no invented estimate"
+    )
+
+
 class DiffusionGenerateProgressResponse(BaseModel):
     """Live per-step progress for an in-flight generation."""
 
     batch: Optional[DiffusionImageBatchProgress] = None
+    load: Optional[DiffusionModelLoadProgress] = None
 
     active: bool = Field(False, description = "Whether a generation is running")
     step: int = Field(0, description = "Denoising steps completed so far")

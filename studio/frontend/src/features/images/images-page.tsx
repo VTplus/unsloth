@@ -188,6 +188,13 @@ import { OnDeviceFoldersDialog } from "@/features/hub/catalog/on-device-folders-
 import { generatePhaseLabel, sameGenerateProgress } from "@/lib/media-generate-phase";
 import { Progress } from "@/components/ui/progress";
 import { imageBatchTitle, imageStepProgress, runFraction } from "./lib/batch-progress";
+import {
+  activeLoadProgress,
+  loadProgressLabel,
+  loadProgressPercent,
+  loadProgressTitle,
+  loadRingFraction,
+} from "./lib/load-progress";
 import { NegativePromptField, PROMPT_BOX_CLASS } from "@/components/negative-prompt-field";
 import {
   ASPECT_RATIOS,
@@ -1851,6 +1858,9 @@ export function ImagesPage({
   // Batch size = images per forward pass (VRAM-heavy); count = sequential loops.
   const [batchSize, setBatchSize] = useState(1);
   const [count, setCount] = useState(1);
+  // Runs of the in-flight request, frozen at Generate: editing the Runs field must not relabel a
+  // running loop whose request was sent with the earlier value.
+  const [commissionedRuns, setCommissionedRuns] = useState<number | null>(null);
   const workflow = useImageWorkflowStore((s) => s.workflow);
   const prompt = prompts[workflow];
   const setWorkflow = useImageWorkflowStore((s) => s.setWorkflow);
@@ -5310,6 +5320,7 @@ export function ImagesPage({
     saveLastPrompt(`images:${workflow}`, prompt);
     setBusy("generating");
     setGenDone(0);
+    setCommissionedRuns(runTotal);
     setGenStep(null);
     cancelRequested.current = false;
     setStopping(false);
@@ -5503,6 +5514,7 @@ export function ImagesPage({
       if (isMounted.current) await refreshStatus();
       setBusy(null);
       setGenDone(null);
+      setCommissionedRuns(null);
       setGenStep(null);
       setStopping(false);
     }
@@ -7085,8 +7097,42 @@ export function ImagesPage({
                 variant="outline"
                 onClick={handleCancelGenerate}
               >
-                <Spinner className="mr-2 size-4" />
-                {stopButtonLabel({ stopping, done: genDone, count })}
+                {(() => {
+                  const fraction = loadRingFraction(activeLoadProgress(genStep));
+                  if (fraction == null) return <Spinner className="mr-2 size-4" />;
+                  const circumference = 2 * Math.PI * 9;
+                  return (
+                    <span
+                      className="relative mr-2 inline-flex size-[18px] shrink-0 items-center justify-center"
+                      aria-hidden="true"
+                    >
+                      <svg viewBox="0 0 24 24" className="absolute inset-0 size-[18px] -rotate-90">
+                        <circle
+                          cx="12"
+                          cy="12"
+                          r="9"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeOpacity={0.2}
+                          strokeWidth={2.5}
+                        />
+                        <circle
+                          cx="12"
+                          cy="12"
+                          r="9"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth={2.5}
+                          strokeLinecap="round"
+                          strokeDasharray={circumference}
+                          strokeDashoffset={circumference * (1 - fraction)}
+                        />
+                      </svg>
+                      <Spinner className="size-2.5" />
+                    </span>
+                  );
+                })()}
+                {stopButtonLabel({ stopping, done: genDone, count: commissionedRuns ?? count })}
               </Button>
             ) : (
               <>
@@ -7358,19 +7404,24 @@ export function ImagesPage({
                     title={[
                       compareRun && genDone != null
                         ? compareRun.title(genDone)
-                        : genDone != null && count > 1
-                          ? `Run ${genDone + 1}/${count}`
+                        : genDone != null && (commissionedRuns ?? count) > 1
+                          ? `Run ${genDone + 1}/${commissionedRuns ?? count}`
                           : null,
-                      imageBatchTitle(genStep),
-                    ].filter(Boolean).join(" · ") || null}
-                    message="Starting…"
-                    progressPercent={genStep ? imageStepProgress(genStep).fraction * 100 : null}
-                    progressLabel={genStep ? genStepLabel(genStep) : null}
+                    ].filter(Boolean).join(" · ") || loadProgressTitle(genStep?.load)}
+                    message={loadProgressTitle(genStep?.load) ? undefined : "Starting…"}
+                    progressPercent={
+                      loadProgressPercent(genStep?.load) ??
+                      (genStep ? imageStepProgress(genStep).fraction * 100 : null)
+                    }
+                    progressLabel={
+                      loadProgressLabel(genStep?.load) ??
+                      (genStep ? genStepLabel(genStep) : null)
+                    }
                   />
                   {genStep?.batch && genStep.batch.total > 1 && (
                     <div className="mt-2 pl-6">
                       <div className="flex justify-between gap-2 text-ui-10 text-muted-foreground">
-                        <span>Batch denoising</span>
+                        <span>{imageBatchTitle(genStep)} · Batch denoising</span>
                         <span className="tabular-nums">
                           {Math.round(genStep.batch.fraction * 100)}%
                           {genStep.batch.total_eta_seconds != null &&
@@ -7384,17 +7435,17 @@ export function ImagesPage({
                       />
                     </div>
                   )}
-                  {!compareRun && runFraction(count, genDone, genStep) != null && (
+                  {!compareRun && runFraction(commissionedRuns ?? count, genDone, genStep) != null && (
                     <div className="mt-2 pl-6">
                       <div className="flex justify-between gap-2 text-ui-10 text-muted-foreground">
                         <span>Run progress</span>
                         <span className="tabular-nums">
-                          {Math.round(runFraction(count, genDone, genStep)! * 100)}%
+                          {Math.round(runFraction(commissionedRuns ?? count, genDone, genStep)! * 100)}%
                         </span>
                       </div>
                       <Progress
                         aria-label="Run progress"
-                        value={runFraction(count, genDone, genStep)! * 100}
+                        value={runFraction(commissionedRuns ?? count, genDone, genStep)! * 100}
                         className="mt-1 h-1"
                       />
                     </div>

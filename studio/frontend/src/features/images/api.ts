@@ -152,8 +152,20 @@ export interface DiffusionImageBatchProgress {
   total_eta_seconds: number | null;
 }
 
+export interface DiffusionModelLoadProgress {
+  phase: "loading" | "ready" | null;
+  bytes_loaded: number;
+  bytes_total: number;
+  // Read bytes over the model files the server was given, clamped to [0,1]; monotonic.
+  fraction: number;
+  vram_mb: number | null;
+  eta_seconds: number | null;
+}
+
 export interface DiffusionGenerateProgress {
   batch?: DiffusionImageBatchProgress | null;
+  // Weight-load phase of the sd-server before the first denoising step; null when nothing is loading.
+  load?: DiffusionModelLoadProgress | null;
   active: boolean;
   step: number;
   total_steps: number;
