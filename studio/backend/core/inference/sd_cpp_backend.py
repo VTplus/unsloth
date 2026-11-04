@@ -2926,8 +2926,13 @@ class _SdGen:
     native_offset: int = 0
     native_count: int = 1
     phase: Optional[str] = None
+    # The load phase ends with the first denoising step; keep it ended when the
+    # next image resets the step counter.
+    load_finished: bool = False
 
     def begin_image(self, offset: int) -> None:
+        if self.step > 0:
+            self.load_finished = True
         self.step = 0
         self.first_step_at = 0.0
         self.eta_seconds = None
@@ -5350,16 +5355,25 @@ class SdCppDiffusionBackend:
 
         Sampled on demand from the UI's progress poll; the sampler keeps a per-pid
         high-water mark, so RSS dropping after the VRAM upload never regresses the bar.
+        The first denoising step ends the load phase for the rest of the generation: the
+        read counter can stop short of the file sum, so the overlay must fall back to the
+        step display instead of lingering at a fraction below 100%.
         """
+        gen = self._gen
+        if gen is not None and (gen.step > 0 or gen.load_finished):
+            return None
         state = self._state
         server = getattr(state, "server", None) if state is not None else None
         process = getattr(server, "_process", None) if server is not None else None
         if process is None or process.poll() is not None:
             return None
         try:
-            return self._load_sampler.snapshot(process.pid, getattr(process, "args", None))
+            snapshot = self._load_sampler.snapshot(process.pid, getattr(process, "args", None))
         except Exception:
             return None
+        if snapshot is not None and snapshot.get("phase") == "ready":
+            return None
+        return snapshot
 
     def cancel_generate(self, expected_account: Optional[str] = None) -> bool:
         """Native runner polls this event and kills the sd-cli process tree, so stop lands within

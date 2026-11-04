@@ -189,11 +189,9 @@ import { generatePhaseLabel, sameGenerateProgress } from "@/lib/media-generate-p
 import { Progress } from "@/components/ui/progress";
 import { imageBatchTitle, imageStepProgress, runFraction } from "./lib/batch-progress";
 import {
-  activeLoadProgress,
-  loadProgressLabel,
+  loadProgressFallbackLabel,
   loadProgressPercent,
   loadProgressTitle,
-  loadRingFraction,
 } from "./lib/load-progress";
 import { NegativePromptField, PROMPT_BOX_CLASS } from "@/components/negative-prompt-field";
 import {
@@ -7097,41 +7095,7 @@ export function ImagesPage({
                 variant="outline"
                 onClick={handleCancelGenerate}
               >
-                {(() => {
-                  const fraction = loadRingFraction(activeLoadProgress(genStep));
-                  if (fraction == null) return <Spinner className="mr-2 size-4" />;
-                  const circumference = 2 * Math.PI * 9;
-                  return (
-                    <span
-                      className="relative mr-2 inline-flex size-[18px] shrink-0 items-center justify-center"
-                      aria-hidden="true"
-                    >
-                      <svg viewBox="0 0 24 24" className="absolute inset-0 size-[18px] -rotate-90">
-                        <circle
-                          cx="12"
-                          cy="12"
-                          r="9"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeOpacity={0.2}
-                          strokeWidth={2.5}
-                        />
-                        <circle
-                          cx="12"
-                          cy="12"
-                          r="9"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth={2.5}
-                          strokeLinecap="round"
-                          strokeDasharray={circumference}
-                          strokeDashoffset={circumference * (1 - fraction)}
-                        />
-                      </svg>
-                      <Spinner className="size-2.5" />
-                    </span>
-                  );
-                })()}
+                <Spinner className="mr-2 size-4" />
                 {stopButtonLabel({ stopping, done: genDone, count: commissionedRuns ?? count })}
               </Button>
             ) : (
@@ -7413,10 +7377,10 @@ export function ImagesPage({
                       loadProgressPercent(genStep?.load) ??
                       (genStep ? imageStepProgress(genStep).fraction * 100 : null)
                     }
-                    progressLabel={
-                      loadProgressLabel(genStep?.load) ??
-                      (genStep ? genStepLabel(genStep) : null)
-                    }
+                    progressLabel={loadProgressFallbackLabel(
+                      genStep?.load,
+                      genStep ? genStepLabel(genStep) : null,
+                    )}
                   />
                   {genStep?.batch && genStep.batch.total > 1 && (
                     <div className="mt-2 pl-6">

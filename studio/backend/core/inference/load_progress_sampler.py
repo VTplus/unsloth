@@ -24,6 +24,12 @@ from typing import Any, Iterable, Optional
 
 MODEL_FLAGS = ("--diffusion-model", "--llm", "--vae", "--tokenizer", "-m", "--model")
 _VRAM_CACHE_SECONDS = 2.0
+# The read counter can stop short of the file sum (mmap'd parts, files the server never reads
+# fully). After this long without growth the load counts as finished; the caller also hides the
+# bar on the first denoising step.
+_IDLE_READY_SECONDS = 15.0
+# Growth below this many bytes between two samples is noise, not progress.
+_GROWTH_BYTES = 100_000
 
 
 def model_file_bytes(args: Optional[Iterable[str]]) -> int:
@@ -104,8 +110,17 @@ if sys.platform == "win32":
         return _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
 
 
+def _darwin_usage(pid: int) -> Optional[tuple[int, int]]:
+    """``(diskio_bytesread, phys_footprint)`` of ``pid`` via the existing libproc helper."""
+    from core.inference.llama_cpp import LlamaCppBackend
+    return LlamaCppBackend._darwin_rusage(pid)
+
+
 def process_read_bytes(pid: int) -> Optional[int]:
-    """Bytes ``pid`` has taken in; None where the OS cannot report it."""
+    """Bytes ``pid`` has taken in; None where the OS cannot report it.
+
+    macOS uses ``ri_diskio_bytesread`` from the existing libproc helper.
+    """
     if os.path.isdir("/proc"):
         try:
             with open(f"/proc/{pid}/io", "r", encoding = "utf-8") as handle:
@@ -115,6 +130,9 @@ def process_read_bytes(pid: int) -> Optional[int]:
         except (FileNotFoundError, PermissionError, ValueError, IndexError, OSError):
             return None
         return None
+    if sys.platform == "darwin":
+        usage = _darwin_usage(pid)
+        return None if usage is None else usage[0]
     if sys.platform != "win32":
         return None
     handle = _open_process(pid)
@@ -130,7 +148,10 @@ def process_read_bytes(pid: int) -> Optional[int]:
 
 
 def process_rss_bytes(pid: int) -> Optional[int]:
-    """Resident bytes of ``pid`` (file-backed on Linux), None where unavailable."""
+    """Resident bytes of ``pid``.
+
+    File-backed on Linux, physical footprint on macOS; None where unavailable.
+    """
     if os.path.isdir("/proc"):
         rss = None
         try:
@@ -143,6 +164,9 @@ def process_rss_bytes(pid: int) -> Optional[int]:
         except (FileNotFoundError, PermissionError, ValueError, IndexError, OSError):
             return None
         return rss
+    if sys.platform == "darwin":
+        usage = _darwin_usage(pid)
+        return None if usage is None else usage[1]
     if sys.platform != "win32":
         return None
     handle = _open_process(pid)
@@ -168,6 +192,8 @@ class LoadProgressSampler:
 
     def __init__(self) -> None:
         self._high_water: dict[int, int] = {}
+        self._prev_loaded: dict[int, int] = {}
+        self._last_growth: dict[int, float] = {}
         self._pid: Optional[int] = None
         self._vram_lock = threading.Lock()
         self._vram_pid: Optional[int] = None
@@ -188,15 +214,24 @@ class LoadProgressSampler:
         rss = process_rss_bytes(pid)
         if read is None and rss is None:
             return None
+        now = time.monotonic()
         loaded = max(read or 0, rss or 0)
         loaded = max(loaded, self._high_water.get(pid, 0))
         self._high_water[pid] = loaded
+        previous = self._prev_loaded.get(pid)
+        if previous is None or loaded > previous + _GROWTH_BYTES:
+            # The first sample starts the clock, so a load whose counters never
+            # grow still becomes ready after the window instead of hanging below 100%.
+            self._last_growth[pid] = now
+        self._prev_loaded[pid] = loaded
         if total > 0:
             # Reads past the weights (headers, a second pass) must not pass the total.
             loaded = min(loaded, total)
         fraction = min(1.0, loaded / total) if total > 0 else 0.0
+        idle = now - self._last_growth.get(pid, now)
+        ready = fraction >= 1.0 or idle >= _IDLE_READY_SECONDS
         return {
-            "phase": "ready" if fraction >= 1.0 else "loading",
+            "phase": "ready" if ready else "loading",
             "bytes_loaded": loaded,
             "bytes_total": total,
             "fraction": round(fraction, 4),
@@ -210,6 +245,8 @@ class LoadProgressSampler:
             return
         self._pid = pid
         self._high_water.clear()
+        self._prev_loaded.clear()
+        self._last_growth.clear()
         with self._vram_lock:
             self._vram_pid = pid
             self._vram_value = None

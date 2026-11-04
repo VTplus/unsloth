@@ -5872,10 +5872,14 @@ class DiffusionModelLoadProgress(BaseModel):
 
     phase: Optional[Literal["loading", "ready"]] = Field(
         None,
-        description = "'loading' while the model files are read, 'ready' once their bytes are in",
+        description = (
+            "'loading' while the model files are read, 'ready' once their bytes are in "
+            "or the loaded bytes have been idle for 15 s"
+        ),
     )
     bytes_loaded: int = Field(
-        0, description = "Bytes the sd-server process has read (high-water mark)"
+        0,
+        description = ("Loaded bytes: max(read bytes, resident set), kept as a high-water mark"),
     )
     bytes_total: int = Field(0, description = "Sum of the model files on the server command line")
     fraction: float = Field(0.0, description = "bytes_loaded / bytes_total, clamped to [0,1]")

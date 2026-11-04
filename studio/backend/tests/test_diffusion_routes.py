@@ -3570,6 +3570,33 @@ def test_generate_progress_exposes_optional_image_batch_data(client, monkeypatch
     assert response.json()["batch"] == batch
 
 
+def test_generate_progress_exposes_optional_load_data(client, monkeypatch):
+    load = {
+        "phase": "loading",
+        "bytes_loaded": 5,
+        "bytes_total": 10,
+        "fraction": 0.5,
+        "vram_mb": 18292,
+        "eta_seconds": None,
+    }
+    backend = diffusion_module.get_diffusion_backend()
+    monkeypatch.setattr(
+        backend,
+        "generate_progress",
+        lambda: {
+            "active": True,
+            "step": 0,
+            "total_steps": 20,
+            "fraction": 0.0,
+            "eta_seconds": None,
+            "load": load,
+        },
+    )
+    response = client.get("/api/inference/images/generate-progress")
+    assert response.status_code == 200
+    assert response.json()["load"] == load
+
+
 @pytest.mark.parametrize(
     "inconsistent",
     [

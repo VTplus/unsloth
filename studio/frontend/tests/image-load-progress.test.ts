@@ -4,17 +4,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type {
-  DiffusionGenerateProgress,
-  DiffusionModelLoadProgress,
-} from "../src/features/images/api.ts";
+import type { DiffusionModelLoadProgress } from "../src/features/images/api.ts";
 import { registerBundlerResolver } from "./helpers/kit.ts";
 
 registerBundlerResolver();
 
-const { activeLoadProgress, loadRingFraction, loadProgressLabel } = await import(
-  "../src/features/images/lib/load-progress.ts"
-);
+const {
+  loadFraction,
+  loadProgressFallbackLabel,
+  loadProgressLabel,
+  loadProgressPercent,
+  loadProgressTitle,
+} = await import("../src/features/images/lib/load-progress.ts");
 
 const load = (over: Partial<DiffusionModelLoadProgress> = {}): DiffusionModelLoadProgress => ({
   phase: "loading",
@@ -26,33 +27,32 @@ const load = (over: Partial<DiffusionModelLoadProgress> = {}): DiffusionModelLoa
   ...over,
 });
 
-const progress = (
-  over: Partial<DiffusionGenerateProgress> = {},
-): DiffusionGenerateProgress => ({
-  active: true,
-  step: 0,
-  total_steps: 10,
-  fraction: 0,
-  eta_seconds: null,
-  ...over,
+test("load fraction follows the read share and disappears when the load is done", () => {
+  assert.equal(loadFraction(load()), 0.5);
+  assert.equal(loadFraction(load({ phase: "ready" })), null);
+  assert.equal(loadFraction(load({ fraction: 1 })), null);
+  assert.equal(loadFraction(null), null);
 });
 
-test("ring fraction follows the read share and disappears when the load is done", () => {
-  assert.equal(loadRingFraction(load()), 0.5);
-  assert.equal(loadRingFraction(load({ phase: "ready" })), null);
-  assert.equal(loadRingFraction(load({ fraction: 1 })), null);
-  assert.equal(loadRingFraction(null), null);
-});
-
-test("active load only exists while the weights are still being read", () => {
-  assert.equal(activeLoadProgress(progress({ load: load() }))?.fraction, 0.5);
-  assert.equal(activeLoadProgress(progress({ load: load({ phase: "ready" }) })), null);
-  assert.equal(activeLoadProgress(progress({ load: load({ fraction: 1 }) })), null);
-  assert.equal(activeLoadProgress(null), null);
-});
-
-test("label carries the VRAM value as the secondary line", () => {
-  assert.equal(loadProgressLabel(load()), "Loading model • 18,292 MB VRAM");
-  assert.equal(loadProgressLabel(load({ vram_mb: null })), "Loading model");
+test("label shows the VRAM value in GiB and hides without it", () => {
+  assert.equal(loadProgressLabel(load()), "17.86 GiB VRAM");
+  assert.equal(loadProgressLabel(load({ vram_mb: null })), null);
   assert.equal(loadProgressLabel(load({ phase: "ready" })), null);
+});
+
+test("overlay helpers derive percent and title from the active load", () => {
+  assert.equal(loadProgressPercent(load()), 50);
+  assert.equal(loadProgressPercent(load({ fraction: 1 })), null);
+  assert.equal(loadProgressTitle(load()), "Loading model");
+  assert.equal(loadProgressTitle(load({ phase: "ready" })), null);
+  assert.equal(loadProgressTitle(null), null);
+});
+
+test("fallback label only uses the step label when no load is active", () => {
+  assert.equal(loadProgressFallbackLabel(load(), "Denoising please wait…"), "17.86 GiB VRAM");
+  assert.equal(loadProgressFallbackLabel(load({ vram_mb: null }), "Denoising please wait…"), null);
+  assert.equal(
+    loadProgressFallbackLabel(load({ phase: "ready" }), "Denoising please wait…"),
+    "Denoising please wait…",
+  );
 });

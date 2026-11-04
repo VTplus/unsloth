@@ -45,6 +45,18 @@ def test_model_file_bytes_sums_flagged_files_and_skips_missing(tmp_path):
     assert sampler_module.model_file_bytes(args) == 150
 
 
+def test_darwin_counters_come_from_the_libproc_pair(monkeypatch):
+    monkeypatch.setattr(sampler_module.sys, "platform", "darwin")
+    monkeypatch.setattr(sampler_module.os.path, "isdir", lambda path: False)
+    monkeypatch.setattr(sampler_module, "_darwin_usage", lambda pid: (1234, 5678))
+    assert sampler_module.process_read_bytes(7) == 1234
+    assert sampler_module.process_rss_bytes(7) == 5678
+    # A failed libproc call leaves the caller on the existing spinner path.
+    monkeypatch.setattr(sampler_module, "_darwin_usage", lambda pid: None)
+    assert sampler_module.process_read_bytes(7) is None
+    assert sampler_module.process_rss_bytes(7) is None
+
+
 def test_snapshot_follows_read_share_and_keeps_high_water(monkeypatch):
     sampler = sampler_module.LoadProgressSampler()
     _patch_readers(monkeypatch, read = 80, rss = 20)
@@ -91,6 +103,55 @@ def test_a_new_pid_does_not_inherit_the_previous_high_water(monkeypatch):
     snap = sampler.snapshot(7, None, total_bytes = 100)
     assert snap["bytes_loaded"] == 80  # same pid still keeps its mark
     assert sampler.snapshot(8, None, total_bytes = 100)["bytes_loaded"] == 5
+
+
+def test_a_stalled_reader_counts_as_ready_after_the_idle_window(monkeypatch):
+    sampler = sampler_module.LoadProgressSampler()
+    clock = [1000.0]
+    monkeypatch.setattr(sampler_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(sampler, "_vram_cached", lambda pid: None)
+    _patch_readers(monkeypatch, read = 200_000, rss = 0)
+    assert sampler.snapshot(7, None, total_bytes = 1_000_000)["phase"] == "loading"
+    # A growing counter keeps the load alive.
+    clock[0] += 10.0
+    _patch_readers(monkeypatch, read = 400_000, rss = 0)
+    assert sampler.snapshot(7, None, total_bytes = 1_000_000)["phase"] == "loading"
+    # The counter stalls short of the file sum: after the idle window the load is done.
+    clock[0] += sampler_module._IDLE_READY_SECONDS + 1.0
+    snap = sampler.snapshot(7, None, total_bytes = 1_000_000)
+    assert snap["phase"] == "ready"
+    assert snap["fraction"] < 1.0
+
+
+def test_rss_growth_keeps_the_load_alive_and_starts_the_idle_clock(monkeypatch):
+    sampler = sampler_module.LoadProgressSampler()
+    clock = [1000.0]
+    monkeypatch.setattr(sampler_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(sampler, "_vram_cached", lambda pid: None)
+    # No read counter at all: only RSS moves (mmap page-in).
+    _patch_readers(monkeypatch, read = None, rss = 200_000)
+    assert sampler.snapshot(7, None, total_bytes = 1_000_000)["phase"] == "loading"
+    clock[0] += 10.0
+    _patch_readers(monkeypatch, read = None, rss = 400_000)
+    assert sampler.snapshot(7, None, total_bytes = 1_000_000)["phase"] == "loading"
+    # The RSS stalls short of the file sum: after the idle window the load is done.
+    clock[0] += sampler_module._IDLE_READY_SECONDS + 1.0
+    snap = sampler.snapshot(7, None, total_bytes = 1_000_000)
+    assert snap["phase"] == "ready"
+    assert snap["fraction"] < 1.0
+
+
+def test_a_new_pid_restarts_the_idle_clock(monkeypatch):
+    sampler = sampler_module.LoadProgressSampler()
+    clock = [1000.0]
+    monkeypatch.setattr(sampler_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(sampler, "_vram_cached", lambda pid: None)
+    _patch_readers(monkeypatch, read = 200_000, rss = 0)
+    assert sampler.snapshot(7, None, total_bytes = 1_000_000)["phase"] == "loading"
+    clock[0] += sampler_module._IDLE_READY_SECONDS + 1.0
+    assert sampler.snapshot(7, None, total_bytes = 1_000_000)["phase"] == "ready"
+    _patch_readers(monkeypatch, read = 5, rss = 0)
+    assert sampler.snapshot(8, None, total_bytes = 1_000_000)["phase"] == "loading"
 
 
 def test_vram_query_runs_off_the_calling_thread(monkeypatch):

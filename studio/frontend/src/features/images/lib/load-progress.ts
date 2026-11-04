@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import type { DiffusionGenerateProgress, DiffusionModelLoadProgress } from "../api";
+import type { DiffusionModelLoadProgress } from "../api";
 
-/** The weight-load object while the model files are still being read; null once their bytes are in. */
-export function activeLoadProgress(
-  progress: DiffusionGenerateProgress | null | undefined,
-): DiffusionModelLoadProgress | null {
-  const load = progress?.load;
-  if (!load || load.phase === "ready" || load.fraction >= 1) return null;
-  return load;
-}
-
-/** Ring fraction for the Stop button, clamped to [0,1]. */
-export function loadRingFraction(
+/** Fraction of the model files read, clamped to [0,1]. */
+export function loadFraction(
   load: DiffusionModelLoadProgress | null | undefined,
 ): number | null {
   if (!load || load.phase === "ready" || load.fraction >= 1) return null;
@@ -24,7 +15,7 @@ export function loadRingFraction(
 export function loadProgressPercent(
   load: DiffusionModelLoadProgress | null | undefined,
 ): number | null {
-  const fraction = loadRingFraction(load);
+  const fraction = loadFraction(load);
   return fraction == null ? null : fraction * 100;
 }
 
@@ -32,16 +23,22 @@ export function loadProgressPercent(
 export function loadProgressTitle(
   load: DiffusionModelLoadProgress | null | undefined,
 ): string | null {
-  return loadRingFraction(load) == null ? null : "Loading model";
+  return loadFraction(load) == null ? null : "Loading model";
 }
 
-/** Overlay label; the VRAM value rides as the secondary line (" • " splits in ModelLoadDescription). */
+/** Overlay label; the VRAM value is the primary label line. */
 export function loadProgressLabel(
   load: DiffusionModelLoadProgress | null | undefined,
 ): string | null {
-  if (loadRingFraction(load) == null) return null;
+  if (loadFraction(load) == null) return null;
   const vram = load?.vram_mb;
-  return vram && vram > 0
-    ? `Loading model • ${vram.toLocaleString("en-US")} MB VRAM`
-    : "Loading model";
+  return vram && vram > 0 ? `${(vram / 1024).toFixed(2)} GiB VRAM` : null;
+}
+
+/** Overlay label; the step label only applies once no load is active. */
+export function loadProgressFallbackLabel(
+  load: DiffusionModelLoadProgress | null | undefined,
+  stepLabel: string | null,
+): string | null {
+  return loadProgressLabel(load) ?? (loadProgressTitle(load) == null ? stepLabel : null);
 }

@@ -3753,3 +3753,43 @@ def test_sampling_lines_after_a_decode_line_do_not_move_the_progress():
     p = b.generate_progress()
     assert (p["step"], p["phase"]) == (4, "decode")
     assert p["batch"]["step"] == 4
+
+
+def test_load_progress_hides_after_the_first_denoising_step():
+    b = SdCppDiffusionBackend.__new__(SdCppDiffusionBackend)
+    b._gen = types.SimpleNamespace(step = 1)
+    assert b._sample_load_progress() is None
+
+
+def test_load_progress_stays_hidden_after_the_first_image():
+    b = SdCppDiffusionBackend.__new__(SdCppDiffusionBackend)
+    b._gen = types.SimpleNamespace(step = 0, load_finished = True)
+    assert b._sample_load_progress() is None
+
+
+def test_begin_image_keeps_the_load_finished():
+    gen = bk._SdGen(total_steps = 4)
+    gen.step = 2
+    gen.begin_image(1)
+    assert gen.load_finished is True
+    assert gen.step == 0
+
+
+def test_begin_image_does_not_finish_the_load_before_a_step():
+    gen = bk._SdGen(total_steps = 4)
+    gen.begin_image(0)
+    assert gen.load_finished is False
+
+
+def test_load_progress_hides_when_the_sampler_reports_ready():
+    b = SdCppDiffusionBackend.__new__(SdCppDiffusionBackend)
+    b._gen = types.SimpleNamespace(step = 0, load_finished = False)
+    b._state = types.SimpleNamespace(
+        server = types.SimpleNamespace(
+            _process = types.SimpleNamespace(pid = 7, poll = lambda: None, args = None)
+        )
+    )
+    b._load_sampler = types.SimpleNamespace(snapshot = lambda pid, args: {"phase": "ready"})
+    assert b._sample_load_progress() is None
+    b._load_sampler = types.SimpleNamespace(snapshot = lambda pid, args: {"phase": "loading"})
+    assert b._sample_load_progress() == {"phase": "loading"}
