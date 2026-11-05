@@ -125,6 +125,7 @@ from .diffusion_multigpu import (
     is_split as multigpu_is_split,
     placement_status as multigpu_placement_status,
     refine_plan_for_multigpu,
+    set_cfg_parallel_fallback,
     uninstall_cfg_parallel,
     with_load_selection,
 )
@@ -3452,8 +3453,18 @@ def _read_cast_cache(
         if not cands:
             return []
         if device is not None:
-            from .video_small_host import stage_misses
-            stage_misses(cands, device, logger = logger, cancel_check = cancel_check)
+            from .video_small_host import converted_others_mib, stage_misses
+            others = converted_others_mib(
+                source,
+                cands,
+                torch_dtype = pipe_kwargs.get("torch_dtype"),
+                cache_dir = None
+                if source and os.path.isdir(str(source))
+                else pipe_kwargs.get("cache_dir"),
+                revision = revision,
+                skip = tuple(pipe_kwargs),
+            )
+            stage_misses(cands, device, logger = logger, cancel_check = cancel_check, others_mib = others)
         hits = read_all(cands, logger = logger, cancel_check = cancel_check)
         pipe_kwargs.update(hits)
         if hits:
@@ -10584,6 +10595,18 @@ class VideoBackend:
                 speed_mode = speed_mode,
                 transformer_quant = transformer_quant_engaged,
                 logger = logger,
+            )
+            # a render-time replica failure hands the denoiser to CFG batching from the next render
+            set_cfg_parallel_fallback(
+                pipe,
+                # called with the pipeline: capturing it here would keep a rolled-back load alive
+                functools.partial(
+                    install_cfg_batch,
+                    offload_policy = offload_policy,
+                    speed_mode = speed_mode,
+                    transformer_quant = transformer_quant_engaged,
+                    logger = logger,
+                ),
             )
             # Opt-in (UNSLOTH_DIFFUSION_BG_COMPILE=1): off by default so the same seed twice repeats.
             from . import diffusion_bg_compile as bg_compile
